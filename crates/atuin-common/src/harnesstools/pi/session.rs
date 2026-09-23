@@ -561,6 +561,7 @@ impl Message for PiMessage {
             output: count("output"),
             cache_read: count("cacheRead"),
             cache_write: count("cacheWrite"),
+            reasoning: None,
         })
     }
 
@@ -723,7 +724,8 @@ mod tests {
                 input: Some(10),
                 output: Some(20),
                 cache_read: Some(5),
-                cache_write: Some(2)
+                cache_write: Some(2),
+                reasoning: None,
             })
         );
     }
@@ -1095,6 +1097,7 @@ mod tests {
             output: Some(output),
             cache_read: Some(0),
             cache_write: Some(0),
+            reasoning: None,
         }
     }
 

@@ -1310,6 +1310,7 @@ mod tests {
             output: 20,
             cache_read: 1,
             cache_write: 2,
+            ..Default::default()
         });
         s.title = Some("hello".to_owned());
 

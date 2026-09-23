@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,10 +7,11 @@ use atuin_common::harnesstools::AnyHarness;
 use atuin_common::harnesstools::session::{AnyMessage, RuntimeError, SessionEvent, SessionId};
 use atuin_common::sync::BlockingPool;
 use futures::StreamExt;
+use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
 use super::Sink;
-use super::message_enricher::MessageEnricher;
+use super::message_enricher::{MessageEnricher, SYNTHETIC};
 
 /// Backoff bounds for retrying a harness listener whose session directory does not exist yet.
 const LISTENER_RETRY_START: Duration = Duration::from_secs(2);
@@ -60,18 +61,32 @@ impl SessionCaptureEngine {
                     }
                 };
 
+                // Transcripts `events()` has just (re)opened, and whether each resumes past its
+                // start: set before the first line of the new read is yielded, so the loop below
+                // sees it with that line.
+                let starts: Starts = Arc::default();
                 let checkpoint = {
-                    let sink = sink.clone();
+                    let (sink, starts) = (sink.clone(), starts.clone());
                     move |id: &SessionId| {
-                        let (sink, id) = (sink.clone(), id.clone());
-                        async move { checkpoint_of(&sink, kind, &id).await }
+                        let (sink, starts, id) = (sink.clone(), starts.clone(), id.clone());
+                        async move {
+                            let at = checkpoint_of(&sink, kind, &id).await;
+                            starts.lock().insert(id, Start::Beginning);
+                            at
+                        }
                     }
                 };
                 let knows = {
-                    let sink = sink.clone();
+                    let (sink, starts) = (sink.clone(), starts.clone());
                     move |id: SessionId, message: AnyMessage| {
-                        let sink = sink.clone();
-                        async move { is_stored(&sink, kind, &id, &message).await }
+                        let (sink, starts) = (sink.clone(), starts.clone());
+                        async move {
+                            let stored = is_stored(&sink, kind, &id, &message).await;
+                            if stored {
+                                starts.lock().insert(id, Start::Resumed);
+                            }
+                            stored
+                        }
                     }
                 };
                 let mut events = listener.events(checkpoint, knows);
@@ -87,33 +102,21 @@ impl SessionCaptureEngine {
                             offset,
                             message,
                         }) => {
-                            // A session's first line this run: warm its bookkeeping from the
-                            // sidecar so a transcript resumed past its start keeps its title,
-                            // parent and usage dedupe. Harmless for one read from the start,
-                            // since every replayed line is a duplicate until the new ones.
-                            if enricher.is_new(&session) {
-                                let handle = enricher.handle(&session);
-                                let row = sink.sidecar.get_session(&handle).await.unwrap_or_else(
-                                    |e| {
-                                        tracing::warn!(?e, %session, "failed to load the ai-session row");
-                                        None
-                                    },
-                                );
-                                let last = sink.sidecar.last_message(&handle).await.unwrap_or_else(
-                                    |e| {
-                                        tracing::warn!(?e, %session, "failed to load the last ai-session message");
-                                        None
-                                    },
-                                );
-                                enricher.seed(&session, row.as_ref(), last.as_ref());
+                            let start = starts.lock().remove(&session);
+                            if let Some(start) = start {
+                                // A new read retries whatever a failed append lost.
+                                stuck.remove(&session);
+                                warm(&sink, &mut enricher, &session, start).await;
                             }
-                            let Some(msg) = enricher.capture(&session, &message) else {
+                            let rows = enricher.capture(&session, &message);
+                            if rows.is_empty() {
                                 continue;
-                            };
-                            if let Err(e) = sink.append(msg).await {
-                                tracing::warn!(?e, "failed to capture ai-session message");
-                                stuck.insert(session);
-                                continue;
+                            }
+                            for msg in rows {
+                                if let Err(e) = sink.append(msg).await {
+                                    tracing::warn!(?e, "failed to capture ai-session message");
+                                    stuck.insert(session.clone());
+                                }
                             }
                             if stuck.contains(&session) {
                                 continue;
@@ -135,13 +138,46 @@ impl SessionCaptureEngine {
     }
 }
 
-/// Where to resume a session's transcript.
-///
-/// A saved offset is trusted only if the line ending exactly there is a message the sidecar
-/// holds: a transcript rewritten in place to the same or a greater length would otherwise resume
-/// mid-content and silently skip the changed lines, which the dedup gate cannot notice. Anything
-/// else (no checkpoint, a shorter file, an unparseable or unknown line) reads from the start,
-/// which only costs work.
+/// Where a fresh read of a transcript starts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Start {
+    Beginning,
+    /// Past its start, from a checkpoint naming a stored message.
+    Resumed,
+}
+
+type Starts = Arc<Mutex<HashMap<SessionId, Start>>>;
+
+/// Set a session's bookkeeping up for a fresh read of its transcript: empty for one read from
+/// the beginning, whose every line replays; warmed from the sidecar for one resumed past its
+/// start, which replays none of the lines before it.
+pub(super) async fn warm(
+    sink: &Sink,
+    enricher: &mut MessageEnricher,
+    session: &SessionId,
+    start: Start,
+) {
+    enricher.restart(session);
+    if start == Start::Beginning {
+        return;
+    }
+    let handle = enricher.handle(session);
+    let row = sink.sidecar.get_session(&handle).await.unwrap_or_else(|e| {
+        tracing::warn!(?e, %session, "failed to load the ai-session row");
+        None
+    });
+    let last = sink.sidecar.last_message(&handle).await.unwrap_or_else(|e| {
+        tracing::warn!(?e, %session, "failed to load the last ai-session message");
+        None
+    });
+    let synthetic =
+        sink.sidecar.source_ids_with_prefix(&handle, SYNTHETIC).await.unwrap_or_else(|e| {
+            tracing::warn!(?e, %session, "failed to load the ai-session synthetic ids");
+            Vec::new()
+        });
+    enricher.resume(session, row.as_ref(), last.as_ref(), &synthetic);
+}
+
 /// The resume token stored for a session, `0` for none.
 async fn checkpoint_of(sink: &Sink, kind: HarnessKind, session: &SessionId) -> u64 {
     match sink.sidecar.checkpoint(&handle_of(kind, session)).await {
@@ -261,7 +297,7 @@ mod tests {
         let mut enricher = MessageEnricher::new(HarnessKind::ClaudeCode);
         for raw in [line("u1"), line("u2")] {
             let m: CcodeMessage = serde_json::from_str(raw.trim_end()).unwrap();
-            let msg = enricher.capture(&session, &AnyMessage::from(m)).unwrap();
+            let msg = enricher.capture(&session, &AnyMessage::from(m)).pop().unwrap();
             sink.append(msg).await.unwrap();
         }
         let handle = enricher.handle(&session);

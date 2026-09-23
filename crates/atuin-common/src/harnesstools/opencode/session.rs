@@ -1591,6 +1591,7 @@ impl Message for OpencodeMessage {
             output,
             cache_read: tokens(&counts["cache"]["read"]),
             cache_write: tokens(&counts["cache"]["write"]),
+            reasoning: None,
         })
     }
 
@@ -3221,6 +3222,7 @@ mod tests {
                 output: Some(290),
                 cache_read: Some(900),
                 cache_write: Some(30),
+                reasoning: None,
             })]);
             let step = find(&messages, "prt_a2");
             assert!(step.content().is_empty());
@@ -3552,15 +3554,15 @@ mod tests {
     #[rstest]
     #[case::whole(
         serde_json::json!({"input": 10, "output": 5, "reasoning": 2, "cache": {"read": 3, "write": 1}}),
-        Some(Usage { input: Some(10), output: Some(7), cache_read: Some(3), cache_write: Some(1) })
+        Some(Usage { input: Some(10), output: Some(7), cache_read: Some(3), cache_write: Some(1), reasoning: None })
     )]
     #[case::fractional_and_negative(
         serde_json::json!({"input": 10.4, "output": -5, "reasoning": 2, "cache": {"read": 3}}),
-        Some(Usage { input: Some(10), output: Some(2), cache_read: Some(3), cache_write: None })
+        Some(Usage { input: Some(10), output: Some(2), cache_read: Some(3), cache_write: None, reasoning: None })
     )]
     #[case::no_output_at_all(
         serde_json::json!({"input": 10}),
-        Some(Usage { input: Some(10), output: None, cache_read: None, cache_write: None })
+        Some(Usage { input: Some(10), output: None, cache_read: None, cache_write: None, reasoning: None })
     )]
     #[case::no_tokens(Value::Null, None)]
     fn a_steps_usage_counts_reasoning_as_output(

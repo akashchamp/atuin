@@ -539,6 +539,7 @@ impl Message for CcodeMessage {
             output: field("output_tokens"),
             cache_read: field("cache_read_input_tokens"),
             cache_write,
+            reasoning: None,
         })
     }
 
@@ -684,7 +685,8 @@ mod tests {
                 input: Some(10),
                 output: Some(20),
                 cache_read: Some(5),
-                cache_write: Some(2)
+                cache_write: Some(2),
+                reasoning: None,
             })
         );
     }

@@ -112,7 +112,7 @@ impl SessionImporter {
                             return ImportProgress::ScanFailed { failed: 1 };
                         };
                         // One enricher per session: it carries that session's bookkeeping (title,
-                        // timestamps, parent, usage dedupe) across its lines, exactly as live
+                        // timestamps, parent, synthetic ids) across its lines, exactly as live
                         // capture does, so a backfilled row matches the captured one.
                         let mut enricher = MessageEnricher::new(kind);
                         let sid = session.id();
@@ -120,20 +120,27 @@ impl SessionImporter {
                         let mut skipped = 0u64;
                         let mut failed = 0u64;
                         let mut messages = session.read();
-                        while let Some(next) = messages.next().await {
-                            let Ok(message) = next else {
-                                failed += 1;
-                                continue;
+                        let mut done = false;
+                        while !done {
+                            let rows = match messages.next().await {
+                                Some(Ok(message)) => enricher.capture(&sid, &message),
+                                Some(Err(_)) => {
+                                    failed += 1;
+                                    continue;
+                                }
+                                None => {
+                                    done = true;
+                                    enricher.finish(&sid)
+                                }
                             };
                             // A bookkeeping line worth no row (matches live capture) is not
                             // counted: it is neither a new record nor a dedupe skip.
-                            let Some(msg) = enricher.capture(&sid, &message) else {
-                                continue;
-                            };
-                            match sink.append(msg).await {
-                                Ok(Appended::New) => imported += 1,
-                                Ok(Appended::Duplicate) => skipped += 1,
-                                Err(_) => failed += 1,
+                            for msg in rows {
+                                match sink.append(msg).await {
+                                    Ok(Appended::New) => imported += 1,
+                                    Ok(Appended::Duplicate) => skipped += 1,
+                                    Err(_) => failed += 1,
+                                }
                             }
                         }
                         ImportProgress::Session {

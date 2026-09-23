@@ -65,6 +65,10 @@ pub struct Message {
     pub git_branch: Option<String>,
     #[builder(default)]
     pub model: Option<String>,
+    /// The usage this row reported, exactly as the harness reported it. Every row of one model
+    /// call (see `turn_id`) may repeat or grow the same figures, and copies of a call in forked
+    /// sessions repeat them again, so rows are never summed: [`Session::usage`] counts each call
+    /// once.
     #[builder(default)]
     pub usage: Option<Usage>,
     #[builder(default)]
@@ -75,10 +79,9 @@ pub struct Message {
     #[builder(default)]
     #[serde(default)]
     pub session_title: Option<String>,
-    /// The model call this row came from. Claude Code splits one response across several lines,
-    /// each repeating the response's usage; rows after the first carry `usage: None`. Must stay
-    /// the LAST field: records are `rmp_serde` positional arrays, and `#[serde(default)]` keeps
-    /// records written before this field existed decodable (they deserialize with `None`).
+    /// The model call this row came from, unique within the harness and the same in every
+    /// session a harness copies the row into. Groups the rows one response is split into, so
+    /// their usage counts once.
     #[builder(default)]
     #[serde(default)]
     pub turn_id: Option<String>,
@@ -99,6 +102,9 @@ pub struct Session {
     pub updated_at: OffsetDateTime,
     #[builder(default)]
     pub message_count: u64,
+    /// Usage attributed to this session: each model call counted once across every session
+    /// holding a copy of it, at the most its rows reported, and owned by the earliest-started
+    /// session holding it that does not descend from another.
     pub usage: Usage,
     #[builder(default)]
     pub title: Option<String>,
@@ -143,9 +149,10 @@ mod tests {
         )
     }
 
-    /// A host running a build from before `turn_id` existed decodes records from a newer host.
+    /// Records are named-field msgpack, so a host whose build predates a field (here `turn_id`)
+    /// still decodes a newer host's records, skipping the field it does not know.
     #[rstest]
-    fn repro_older_decoder_rejects_record_with_newer_trailing_field() {
+    fn older_decoder_ignores_a_newer_field() {
         #[derive(Deserialize)]
         #[allow(dead_code)]
         struct OldMessage {
@@ -178,8 +185,8 @@ mod tests {
             .content(vec![])
             .turn_id(Some("msg_1".to_owned()))
             .build();
-        let bytes = rmp_serde::to_vec(&msg).unwrap();
-        let old = rmp_serde::from_slice::<OldMessage>(&bytes);
+        let record = crate::ai_session::AiSessionRecord::Message(msg).serialize();
+        let old = rmp_serde::from_slice::<OldMessage>(&record[1..]);
         assert!(old.is_ok(), "older host cannot decode: {:?}", old.err());
     }
 
@@ -193,7 +200,7 @@ mod tests {
     proptest! {
         #[test]
         fn message_msgpack_roundtrips(m in arb_message()) {
-            let bytes = rmp_serde::to_vec(&m).unwrap();
+            let bytes = rmp_serde::to_vec_named(&m).unwrap();
             let back: Message = rmp_serde::from_slice(&bytes).unwrap();
             prop_assert_eq!(m, back);
         }
