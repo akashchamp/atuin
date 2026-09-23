@@ -33,6 +33,11 @@ pub enum Content {
     ReasoningSummary {
         tokens: Option<u64>,
     },
+    /// A model-written summary standing in for earlier conversation (compaction, an abandoned
+    /// branch). Conversation text whatever the line's role.
+    Summary(String),
+    /// Why a model call failed or was aborted, as the harness reported it.
+    Error(String),
 }
 
 /// Human-readable breadcrumb shared by transcript and RPC rendering.

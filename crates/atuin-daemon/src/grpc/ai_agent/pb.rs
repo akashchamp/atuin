@@ -142,6 +142,8 @@ impl From<Content> for ContentBlock {
                 },
                 is_error: tr.error,
             }),
+            Content::Summary(text) => Block::Summary(text),
+            Content::Error(text) => Block::Error(text),
             Content::Other(v) => Block::Text(v.to_string()),
         };
 

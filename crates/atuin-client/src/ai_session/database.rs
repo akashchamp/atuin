@@ -794,7 +794,10 @@ impl AiSessionDatabase {
 
     fn push_content_text(out: &mut String, content: &Content) {
         match content {
-            Content::Text(text) | Content::Reasoning(text) => {
+            Content::Text(text)
+            | Content::Reasoning(text)
+            | Content::Summary(text)
+            | Content::Error(text) => {
                 out.push_str(text);
                 out.push('\n');
             }
