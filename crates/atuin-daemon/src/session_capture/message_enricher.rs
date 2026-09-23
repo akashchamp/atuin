@@ -581,6 +581,7 @@ mod tests {
 #[cfg(test)]
 mod repro {
     use atuin_common::harnesstools::ccode::session::CcodeMessage;
+    use atuin_common::harnesstools::pi::session::PiMessage;
     use rstest::rstest;
 
     use super::*;
@@ -699,5 +700,76 @@ mod repro {
 
     fn session() -> SessionId {
         SessionId::from("s1".to_owned())
+    }
+    // ---- Pi audit repros (expected to FAIL until fixed) ----
+
+    fn pi(raw: &serde_json::Value) -> AnyMessage {
+        AnyMessage::Pi(serde_json::from_str::<PiMessage>(&raw.to_string()).unwrap())
+    }
+
+    const PARENT: &str = "0199aaaa-0000-7000-8000-000000000001";
+    const FORK: &str = "0199bbbb-0000-7000-8000-000000000002";
+
+    fn fork_header() -> AnyMessage {
+        // pi-mono session-manager.ts:1851 (`forkFrom`) / :1674 (`createBranchedSession`) write the
+        // parent's resolved file path here.
+        pi(&serde_json::json!({
+            "type": "session", "version": 3, "id": FORK, "timestamp": "2026-09-18T11:00:00Z",
+            "cwd": "/w",
+            "parentSession": format!(
+                "/home/u/.pi/agent/sessions/--w--/2026-09-18T10-00-00-000Z_{PARENT}.jsonl"),
+        }))
+    }
+
+    /// A fork's rows should point at the parent session row, which is keyed by the parent's id.
+    #[rstest]
+    fn repro_pi_fork_parent_is_the_parent_session_id() {
+        let fork = SessionId::from(FORK.to_owned());
+        let msg = MessageEnricher::new(HarnessKind::Pi).capture(&fork, &fork_header()).unwrap();
+        assert_eq!(msg.parent.map(|p| p.session), Some(NativeSessionId::from(PARENT.to_owned())));
+    }
+
+    /// `/fork` and `/tree`-to-new-session copy every prior entry verbatim, ids and assistant
+    /// usage included (session-manager.ts:1856-1859, :1637-1655). Rows are unique per
+    /// (harness, session_id, source_id), so the copies become new rows in the fork and their
+    /// usage is summed a second time into the fork's session totals. tokscale dedupes these
+    /// cross-session for the same reason (tokscale sessions/pi.rs:354-356).
+    #[rstest]
+    fn repro_pi_fork_does_not_recount_copied_usage() {
+        let assistant = pi(&serde_json::json!({
+            "type": "message", "id": "a1b2c3d4", "parentId": "u1", "timestamp": "2026-09-18T10:00:05Z",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}],
+                "model": "m", "responseId": "resp_1", "stopReason": "stop",
+                "usage": {"input": 100, "output": 50, "cacheRead": 1000, "cacheWrite": 10}},
+        }));
+        let parent = SessionId::from(PARENT.to_owned());
+        let fork = SessionId::from(FORK.to_owned());
+        let mut n = MessageEnricher::new(HarnessKind::Pi);
+        let original = n.capture(&parent, &assistant).unwrap();
+        assert!(original.usage.is_some());
+        n.capture(&fork, &fork_header());
+        let copy = n.capture(&fork, &assistant).unwrap();
+        assert_eq!(copy.usage, None, "copied assistant turn counted again in the fork");
+    }
+
+    /// pi migrates v1/v2 files in place when it opens them (session-manager.ts:1092-1093
+    /// `_rewriteFile`), assigning fresh ids to lines that had none (session-manager.ts:287
+    /// `migrateV1ToV2`). A line captured before the rewrite got a content-addressed id; the same
+    /// line after it gets its new native id, so a re-read captures it (and its usage) twice.
+    #[rstest]
+    fn repro_pi_migrated_line_keeps_its_source_id() {
+        let before = serde_json::json!({
+            "type": "message", "timestamp": "2026-01-01T00:00:00Z",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}],
+                "usage": {"input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0}},
+        });
+        let mut after = before.clone();
+        after["id"] = serde_json::json!("1a2b3c4d");
+        after["parentId"] = serde_json::Value::Null;
+        let s = session();
+        assert_eq!(
+            MessageEnricher::source_id(&s, &pi(&before)),
+            MessageEnricher::source_id(&s, &pi(&after))
+        );
     }
 }

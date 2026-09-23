@@ -756,4 +756,147 @@ mod tests {
         assert!(tool_uses >= 1, "expected at least one normalized toolCall");
         assert!(tool_results >= 1, "expected at least one normalized toolResult");
     }
+
+    // ---- Audit repros (expected to FAIL until the parser is fixed) ----
+
+    fn pi(raw: &serde_json::Value) -> PiMessage {
+        serde_json::from_str(&raw.to_string()).unwrap()
+    }
+
+    fn texts(m: &PiMessage) -> Vec<String> {
+        m.content()
+            .into_iter()
+            .filter_map(|c| match c {
+                Content::Text(t) => Some(t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// pi writes `parentSession` as the parent's *file path* (session-manager.ts:1674
+    /// `createBranchedSession`, :1851 `forkFrom`), never its id. The parser passes it through
+    /// verbatim, so the fork's parent is a path no session row is keyed by.
+    #[rstest]
+    #[case("/home/u/.pi/agent/sessions/--w--/2026-09-18T10-00-00-000Z_0199aaaa-bbbb.jsonl")]
+    #[case("2026-09-18T10-00-00-000Z_0199aaaa-bbbb.jsonl")]
+    fn repro_header_parent_session_path_resolves_to_the_parent_id(#[case] parent: &str) {
+        let m = pi(&serde_json::json!({
+            "type": "session", "version": 3, "id": "0199cccc", "timestamp": "2026-09-18T10:00:00Z",
+            "cwd": "/w", "parentSession": parent,
+        }));
+        assert_eq!(m.parent_session(), Some(SessionId::from("0199aaaa-bbbb".to_owned())));
+    }
+
+    /// A failed assistant turn (`stopReason: "error"`) typically has empty content; the only
+    /// user-visible text is `errorMessage` (pi-ai types.ts AssistantMessage.errorMessage, shown
+    /// by the TUI assistant-message.ts:190). The parser drops it.
+    #[rstest]
+    #[case("error", "529 overloaded_error")]
+    #[case("aborted", "Request was aborted")]
+    fn repro_assistant_error_message_is_kept(#[case] stop: &str, #[case] error: &str) {
+        let m = pi(&serde_json::json!({
+            "type": "message", "id": "a1", "parentId": "u1", "timestamp": "2026-09-18T10:00:00Z",
+            "message": {"role": "assistant", "content": [], "stopReason": stop, "errorMessage": error,
+                "model": "m", "usage": {"input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0}},
+        }));
+        assert!(
+            texts(&m).iter().any(|t| t.contains(error)),
+            "errorMessage lost: {:?}",
+            m.content()
+        );
+    }
+
+    /// `compaction` / `branch_summary` carry a top-level `summary` (session-manager.ts:91,106) that
+    /// pi feeds back into context (session-manager.ts:458-463); the parser only reads `message`.
+    #[rstest]
+    #[case(serde_json::json!({"type": "compaction", "id": "c1", "parentId": "a1",
+        "timestamp": "2026-09-18T10:00:00Z", "summary": "SUMMARY-TEXT", "firstKeptEntryId": "u1",
+        "tokensBefore": 1000}))]
+    #[case(serde_json::json!({"type": "branch_summary", "id": "b1", "parentId": "a1",
+        "timestamp": "2026-09-18T10:00:00Z", "summary": "SUMMARY-TEXT", "fromId": "a9"}))]
+    fn repro_summary_entries_keep_their_summary(#[case] raw: serde_json::Value) {
+        let m = pi(&raw);
+        assert!(
+            texts(&m).iter().any(|t| t.contains("SUMMARY-TEXT")),
+            "summary lost: {:?}",
+            m.content()
+        );
+    }
+
+    /// `compaction` / `branch_summary` record the usage of the LLM call that wrote the summary as
+    /// a top-level `usage` (session-manager.ts:99,113); it is never reported.
+    #[rstest]
+    #[case("compaction")]
+    #[case("branch_summary")]
+    fn repro_summary_entries_report_their_usage(#[case] kind: &str) {
+        let m = pi(&serde_json::json!({
+            "type": kind, "id": "c1", "parentId": "a1", "timestamp": "2026-09-18T10:00:00Z",
+            "summary": "s", "firstKeptEntryId": "u1", "fromId": "a9", "tokensBefore": 1000,
+            "usage": {"input": 900, "output": 100, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 1000},
+        }));
+        assert_eq!(
+            m.usage(),
+            Some(Usage {
+                input: Some(900),
+                output: Some(100),
+                cache_read: Some(0),
+                cache_write: Some(0)
+            })
+        );
+    }
+
+    /// `custom_message` keeps its content at the top level (session-manager.ts:159), not under
+    /// `message`, and pi injects it into context as a message (session-manager.ts:453).
+    #[rstest]
+    fn repro_custom_message_entry_keeps_its_content() {
+        let m = pi(&serde_json::json!({
+            "type": "custom_message", "id": "x1", "parentId": "a1", "timestamp": "2026-09-18T10:00:00Z",
+            "customType": "ext", "content": "INJECTED", "display": true,
+        }));
+        assert_eq!(texts(&m), vec!["INJECTED".to_owned()]);
+    }
+
+    /// A tool result's `usage` is "not part of main LLM context accounting" (pi-ai types.ts:571);
+    /// tokscale counts assistant usage only (tokscale sessions/pi.rs:523). The parser reports it.
+    #[rstest]
+    fn repro_tool_result_usage_is_not_session_usage() {
+        let m = pi(&serde_json::json!({
+            "type": "message", "id": "t1", "parentId": "a1", "timestamp": "2026-09-18T10:00:00Z",
+            "message": {"role": "toolResult", "toolCallId": "c1", "toolName": "subagent",
+                "content": [], "isError": false,
+                "usage": {"input": 5000, "output": 500, "cacheRead": 0, "cacheWrite": 0}},
+        }));
+        assert_eq!(m.usage(), None);
+    }
+
+    /// An empty `session_info` name clears the title (session-manager.ts:1318-1323
+    /// `getSessionName`); the parser reports `Some("")`.
+    #[rstest]
+    #[case("")]
+    #[case("   ")]
+    fn repro_empty_session_info_name_is_no_title(#[case] name: &str) {
+        let m = pi(&serde_json::json!({"type": "session_info", "id": "i1", "parentId": "a1",
+            "timestamp": "2026-09-18T10:00:00Z", "name": name}));
+        assert_eq!(m.title(), None);
+    }
+
+    /// `pi --session <path>` keeps any explicit file name (session-manager.ts `_setSessionFile`,
+    /// "preserve explicit path"), so the file stem is not the session id; the header's `id` is.
+    #[rstest]
+    #[tokio::test]
+    async fn repro_session_id_comes_from_the_header_not_the_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("my_notes.jsonl"),
+            serde_json::json!({"type": "session", "version": 3, "id": "0199dddd", "cwd": "/w",
+                "timestamp": "2026-09-18T10:00:00Z"})
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let sessions = PiSessions::builder().root(dir.path().to_path_buf()).pool(pool()).build();
+        let ids: Vec<String> =
+            sessions.existing().unwrap().map(|s| s.unwrap().id().into()).collect().await;
+        assert_eq!(ids, vec!["0199dddd".to_owned()]);
+    }
 }
