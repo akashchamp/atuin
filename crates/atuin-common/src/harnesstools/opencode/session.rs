@@ -2707,4 +2707,293 @@ mod tests {
             [Content::Other(v)] if v["prompt"]["text"] == "second prompt from B"
         ));
     }
+
+    /// Repros from the opencode parser audit. Payloads follow opencode's durable event schemas
+    /// (`packages/schema/src/v1/session.ts`: `session.created`/`session.updated` carry the whole
+    /// `SessionInfo`, `message.updated` the whole `Assistant`/`User` info, `message.part.updated`
+    /// `{sessionID, part, time}`). Every test here is expected to FAIL until the parser is fixed.
+    mod repro {
+        use super::*;
+        use crate::harnesstools::session::model::{StopReason, Usage};
+
+        const SES: &str = "ses_R";
+
+        /// Every message the event log yields, read out by a one-shot backfill.
+        async fn backfill(path: &Path) -> Vec<OpencodeMessage> {
+            let sessions: Vec<OpencodeSession> = OpencodeSessions::builder()
+                .db(path)
+                .build()
+                .existing()
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+                .await;
+            let mut out = Vec::new();
+            for session in sessions {
+                let messages: Vec<_> = session.messages().collect().await;
+                out.extend(messages.into_iter().map(Result::unwrap));
+            }
+            out
+        }
+
+        fn session_info(title: &str, parent: Option<&str>) -> Value {
+            let mut info = serde_json::json!({
+                "id": SES, "slug": "s", "projectID": "p", "directory": "/work/proj",
+                "title": title, "version": "1.0.0",
+                "time": {"created": 1_700_000_000_000i64, "updated": 1_700_000_000_000i64},
+            });
+            if let Some(parent) = parent {
+                info["parentID"] = Value::from(parent);
+            }
+            info
+        }
+
+        /// An assistant `message.updated` as opencode's processor writes it at `step-finish`
+        /// (`processor.ts`: `assistantMessage.tokens = usage.tokens; finish = reason`).
+        fn assistant_info(tokens_in: u64, error: Option<Value>) -> Value {
+            let mut info = serde_json::json!({
+                "id": "msg_a1", "sessionID": SES, "role": "assistant",
+                "time": {"created": 1_700_000_001_000i64, "completed": 1_700_000_009_000i64},
+                "parentID": "msg_u1", "modelID": "claude-sonnet-4", "providerID": "anthropic",
+                "mode": "build", "agent": "build",
+                "path": {"cwd": "/work/proj/sub", "root": "/work/proj"},
+                "cost": 0.0123,
+                "tokens": {"input": tokens_in, "output": 250, "reasoning": 40,
+                           "cache": {"read": 900, "write": 30}},
+                "finish": "stop",
+            });
+            if let Some(error) = error {
+                info["error"] = error;
+            }
+            info
+        }
+
+        /// One realistic assistant turn: user prompt, assistant info (zero tokens when created,
+        /// filled in at step-finish), a finished text part, a step-finish part.
+        async fn seed_turn(db: &Sqlite) {
+            let created =
+                serde_json::json!({"sessionID": SES, "info": session_info("New session", None)});
+            insert_event(db, "evt_00", SES, "session.created.1", &created.to_string()).await;
+            let user = serde_json::json!({"sessionID": SES, "info": {
+                "id": "msg_u1", "sessionID": SES, "role": "user",
+                "time": {"created": 1_700_000_000_500i64}, "agent": "build",
+                "model": {"providerID": "anthropic", "modelID": "claude-sonnet-4"}}});
+            insert_event(db, "evt_01", SES, "message.updated.1", &user.to_string()).await;
+            text_row(db, "evt_02", SES, "prt_u1", "msg_u1", "hello").await;
+            let fresh = serde_json::json!({"sessionID": SES, "info": assistant_info(0, None)});
+            insert_event(db, "evt_03", SES, "message.updated.1", &fresh.to_string()).await;
+            let text = serde_json::json!({"sessionID": SES, "time": 1_700_000_005_000i64, "part": {
+                "id": "prt_a1", "sessionID": SES, "messageID": "msg_a1", "type": "text",
+                "text": "hi there",
+                "time": {"start": 1_700_000_002_000i64, "end": 1_700_000_005_000i64}}});
+            insert_event(db, "evt_04", SES, "message.part.updated.1", &text.to_string()).await;
+            let step = serde_json::json!({"sessionID": SES, "time": 1_700_000_008_000i64, "part": {
+                "id": "prt_a2", "sessionID": SES, "messageID": "msg_a1", "type": "step-finish",
+                "reason": "stop", "cost": 0.0123,
+                "tokens": {"input": 1200, "output": 250, "reasoning": 40,
+                           "cache": {"read": 900, "write": 30}}}});
+            insert_event(db, "evt_05", SES, "message.part.updated.1", &step.to_string()).await;
+            let done = serde_json::json!({"sessionID": SES, "info": assistant_info(1200, None)});
+            insert_event(db, "evt_06", SES, "message.updated.1", &done.to_string()).await;
+        }
+
+        async fn seeded() -> (tempfile::TempDir, Vec<OpencodeMessage>) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("opencode.db");
+            let db = event_db(&path).await;
+            seed_turn(&db).await;
+            let messages = backfill(&path).await;
+            (dir, messages)
+        }
+
+        #[rstest]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn repro_assistant_usage_is_never_captured() {
+            let (_dir, messages) = seeded().await;
+            let usage: Vec<Usage> = messages.iter().filter_map(Message::usage).collect();
+            assert_eq!(
+                usage,
+                vec![Usage {
+                    input: Some(1200),
+                    output: Some(250),
+                    cache_read: Some(900),
+                    cache_write: Some(30),
+                }],
+                "opencode reports the turn's tokens on message.updated and step-finish; exactly \
+                 one captured row should carry them"
+            );
+        }
+
+        #[rstest]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn repro_assistant_model_is_never_captured() {
+            let (_dir, messages) = seeded().await;
+            assert!(
+                messages.iter().any(|m| m.model().as_deref() == Some("claude-sonnet-4")),
+                "no captured row names the model (message.updated info.modelID)"
+            );
+        }
+
+        #[rstest]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn repro_assistant_cwd_is_never_captured() {
+            let (_dir, messages) = seeded().await;
+            assert!(
+                messages.iter().any(|m| m.cwd() == Some(PathBuf::from("/work/proj/sub"))),
+                "no captured row carries the cwd (message.updated info.path.cwd)"
+            );
+        }
+
+        #[rstest]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn repro_assistant_stop_reason_is_never_captured() {
+            let (_dir, messages) = seeded().await;
+            assert!(
+                messages.iter().any(|m| m.stop_reason().is_some()),
+                "no captured row carries the stop reason (info.finish / step-finish.reason)"
+            );
+        }
+
+        #[rstest]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn repro_assistant_parts_do_not_link_to_the_user_message() {
+            let (_dir, messages) = seeded().await;
+            let reply = messages
+                .iter()
+                .find(|m| m.id() == Some(MessageId::from("prt_a1".to_owned())))
+                .expect("the assistant text is delivered");
+            assert!(
+                reply.parent_id().is_some() || reply.turn_id().is_some(),
+                "the assistant text carries neither its message id (turn) nor a link to the user \
+                 message it answers (info.parentID)"
+            );
+        }
+
+        /// An assistant turn that fails before any part is written (auth error, API error, an
+        /// abort before the first token) exists only as `message.updated` with `info.error`.
+        #[rstest]
+        #[case::aborted(
+            serde_json::json!({"name": "MessageAbortedError", "data": {"message": "aborted"}})
+        )]
+        #[case::api(serde_json::json!({
+            "name": "APIError", "data": {"message": "overloaded", "isRetryable": true}
+        }))]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn repro_a_failed_assistant_turn_is_lost(#[case] error: Value) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("opencode.db");
+            let db = event_db(&path).await;
+            role_row(&db, "evt_00", SES, "msg_u1", "user").await;
+            text_row(&db, "evt_01", SES, "prt_u1", "msg_u1", "hello").await;
+            let failed =
+                serde_json::json!({"sessionID": SES, "info": assistant_info(0, Some(error))});
+            insert_event(&db, "evt_02", SES, "message.updated.1", &failed.to_string()).await;
+            let messages = backfill(&path).await;
+            assert!(
+                messages.iter().any(|m| matches!(
+                    m.stop_reason(),
+                    Some(StopReason::Error | StopReason::Aborted)
+                )),
+                "the failed turn leaves no trace: got {} rows, none with an error",
+                messages.len()
+            );
+        }
+
+        #[rstest]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn repro_session_title_is_never_captured() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("opencode.db");
+            let db = event_db(&path).await;
+            seed_turn(&db).await;
+            // opencode's ensureTitle -> setTitle publishes session.updated with the full info
+            let retitled = serde_json::json!({
+                "sessionID": SES, "info": session_info("Fix the flaky test", None)
+            });
+            insert_event(&db, "evt_07", SES, "session.updated.1", &retitled.to_string()).await;
+            let messages = backfill(&path).await;
+            assert!(
+                messages.iter().any(|m| m.title().as_deref() == Some("Fix the flaky test")),
+                "the generated title (session.updated.1 info.title) is never surfaced"
+            );
+        }
+
+        /// A task-tool subagent session is created with `parentID` (`tool/task.ts`).
+        #[rstest]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn repro_child_session_parent_is_lost() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("opencode.db");
+            let db = event_db(&path).await;
+            let created = serde_json::json!({
+                "sessionID": SES, "info": session_info("sub", Some("ses_parent"))
+            });
+            insert_event(&db, "evt_00", SES, "session.created.1", &created.to_string()).await;
+            role_row(&db, "evt_01", SES, "msg_u1", "user").await;
+            text_row(&db, "evt_02", SES, "prt_u1", "msg_u1", "do the subtask").await;
+            let messages = backfill(&path).await;
+            assert!(!messages.is_empty());
+            assert!(
+                messages
+                    .iter()
+                    .any(|m| m.parent_session() == Some(SessionId::from("ses_parent".to_owned()))),
+                "the subagent session's parent (session.created.1 info.parentID) is dropped"
+            );
+        }
+
+        /// `@file` in a prompt makes opencode run the Read tool itself and store its output as a
+        /// `synthetic` text part of the *user* message (`session/prompt.ts`).
+        #[rstest]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn repro_synthetic_file_contents_surface_as_user_text() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("opencode.db");
+            let db = event_db(&path).await;
+            role_row(&db, "evt_00", SES, "msg_u1", "user").await;
+            text_row(&db, "evt_01", SES, "prt_u1", "msg_u1", "look at @config.env").await;
+            let synthetic = serde_json::json!({"sessionID": SES, "time": 1_700_000_000_000i64,
+                "part": {
+                    "id": "prt_u2", "sessionID": SES, "messageID": "msg_u1", "type": "text",
+                    "synthetic": true, "text": "<file>\n00001| DB_HOST=prod.internal\n</file>"}});
+            insert_event(&db, "evt_02", SES, "message.part.updated.1", &synthetic.to_string())
+                .await;
+            let messages = backfill(&path).await;
+            let injected = messages
+                .iter()
+                .find(|m| m.id() == Some(MessageId::from("prt_u2".to_owned())))
+                .expect("delivered");
+            assert!(
+                !(injected.role() == Role::User
+                    && matches!(injected.content().as_slice(), [Content::Text(_)])),
+                "the Read tool's output is captured as text the user typed: {:?}",
+                injected.content()
+            );
+        }
+
+        /// `/undo` (session/revert.ts) removes messages and parts with durable
+        /// `message.removed.1` / `message.part.removed.1` events.
+        #[rstest]
+        #[case::part(
+            "message.part.removed.1",
+            serde_json::json!({"sessionID": SES, "messageID": "msg_u1", "partID": "prt_u1"})
+        )]
+        #[case::message(
+            "message.removed.1",
+            serde_json::json!({"sessionID": SES, "messageID": "msg_u1"})
+        )]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn repro_a_revert_is_invisible(#[case] kind: &str, #[case] data: Value) {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("opencode.db");
+            let db = event_db(&path).await;
+            role_row(&db, "evt_00", SES, "msg_u1", "user").await;
+            text_row(&db, "evt_01", SES, "prt_u1", "msg_u1", "oops").await;
+            insert_event(&db, "evt_02", SES, kind, &data.to_string()).await;
+            let messages = backfill(&path).await;
+            assert!(
+                messages.len() > 1,
+                "the removal is dropped; the reverted part stays captured as if it stood"
+            );
+        }
+    }
 }
