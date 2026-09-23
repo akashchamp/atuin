@@ -143,6 +143,46 @@ mod tests {
         )
     }
 
+    /// A host running a build from before `turn_id` existed decodes records from a newer host.
+    #[rstest]
+    fn repro_older_decoder_rejects_record_with_newer_trailing_field() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct OldMessage {
+            id: RecordId,
+            session: HarnessSession,
+            source_id: SourceId,
+            parent: Option<HarnessSession>,
+            parent_source_id: Option<SourceId>,
+            thread: Option<String>,
+            timestamp: OffsetDateTime,
+            role: Role,
+            content: Vec<Content>,
+            cwd: Option<PathBuf>,
+            git_branch: Option<String>,
+            model: Option<String>,
+            usage: Option<Usage>,
+            stop_reason: Option<StopReason>,
+            #[serde(default)]
+            session_title: Option<String>,
+        }
+        let msg = Message::builder()
+            .id(RecordId(atuin_common::utils::uuid_v7()))
+            .session(HarnessSession {
+                harness: HarnessKind::ClaudeCode,
+                session: NativeSessionId::from("s".to_owned()),
+            })
+            .source_id(SourceId::from("x".to_owned()))
+            .timestamp(OffsetDateTime::UNIX_EPOCH)
+            .role(Role::User)
+            .content(vec![])
+            .turn_id(Some("msg_1".to_owned()))
+            .build();
+        let bytes = rmp_serde::to_vec(&msg).unwrap();
+        let old = rmp_serde::from_slice::<OldMessage>(&bytes);
+        assert!(old.is_ok(), "older host cannot decode: {:?}", old.err());
+    }
+
     #[rstest]
     fn harness_kind_covers_every_known_harness() {
         for harness in AnyHarness::all() {

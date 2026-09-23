@@ -767,3 +767,281 @@ mod tests {
         );
     }
 }
+
+/// Reproductions of capture-pipeline defects found in audit. Each test asserts the EXPECTED
+/// behaviour and currently fails.
+#[cfg(test)]
+mod repro_tests {
+    use atuin_client::ai_session::HarnessSession;
+    use atuin_common::harnesstools::session::{AnyMessage, SessionId};
+    use rstest::{fixture, rstest};
+
+    use super::message_enricher::MessageEnricher;
+    use super::*;
+
+    #[fixture]
+    async fn sink() -> Sink {
+        let store = SqliteStore::in_memory(NOP_STORE_TIMEOUT).await.unwrap();
+        let records = AiSessionStore::builder()
+            .store(store)
+            .host_id(HostId(atuin_common::utils::uuid_v7()))
+            .key(Key::generate())
+            .build();
+        Sink::new(records, AiSessionDatabase::in_memory().await.unwrap())
+    }
+
+    fn ccode(raw: serde_json::Value) -> AnyMessage {
+        AnyMessage::Ccode(serde_json::from_value(raw).unwrap())
+    }
+
+    fn codex(raw: serde_json::Value) -> AnyMessage {
+        AnyMessage::Codex(serde_json::from_value(raw).unwrap())
+    }
+
+    fn pi(raw: serde_json::Value) -> AnyMessage {
+        AnyMessage::Pi(serde_json::from_value(raw).unwrap())
+    }
+
+    /// A Claude Code assistant row of model call `turn`, reporting `output` tokens.
+    fn cc_assistant(uuid: &str, turn: &str, output: u64, ts: &str) -> AnyMessage {
+        ccode(serde_json::json!({
+            "type": "assistant", "uuid": uuid, "sessionId": "s1", "timestamp": ts,
+            "message": {"role": "assistant", "id": turn,
+                "content": [{"type": "tool_use", "id": format!("t-{uuid}"), "name": "Bash", "input": {}}],
+                "usage": {"input_tokens": 2, "output_tokens": output}},
+        }))
+    }
+
+    fn cc_tool_result(uuid: &str, ts: &str) -> AnyMessage {
+        ccode(serde_json::json!({
+            "type": "user", "uuid": uuid, "sessionId": "s1", "timestamp": ts,
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t", "content": "ok"}]},
+        }))
+    }
+
+    async fn capture_all(
+        sink: &Sink,
+        enricher: &mut MessageEnricher,
+        session: &SessionId,
+        lines: &[AnyMessage],
+    ) -> Vec<Appended> {
+        let mut out = Vec::new();
+        for m in lines {
+            if let Some(msg) = enricher.capture(session, m) {
+                out.push(sink.append(msg).await.unwrap());
+            }
+        }
+        out
+    }
+
+    /// What the engine does for a session's first line after a restart.
+    async fn seeded(sink: &Sink, kind: HarnessKind, session: &SessionId) -> MessageEnricher {
+        let mut enricher = MessageEnricher::new(kind);
+        let handle = enricher.handle(session);
+        let row = sink.sidecar.get_session(&handle).await.unwrap();
+        let last = sink.sidecar.last_message(&handle).await.unwrap();
+        enricher.seed(session, row.as_ref(), last.as_ref());
+        enricher
+    }
+
+    async fn output_of(sink: &Sink, handle: &HarnessSession) -> u64 {
+        sink.sidecar.get_session(handle).await.unwrap().unwrap().usage.output.unwrap()
+    }
+
+    /// Claude Code writes the tool_use blocks of one response on separate lines with the user
+    /// tool_result lines interleaved between them (see fixtures/ccode/session1.jsonl and
+    /// session2.jsonl). A restart that lands on the tool_result seeds `last_turn` from that
+    /// usage-less row, so the next row of the same model call counts its usage a second time.
+    #[rstest]
+    #[tokio::test]
+    async fn repro_restart_after_tool_result_double_counts_usage(#[future] sink: Sink) {
+        let sink = sink.await;
+        let session = SessionId::from("s1".to_owned());
+        let lines = [
+            cc_assistant("a1", "msg_X", 152, "2026-09-18T10:00:00.000Z"),
+            cc_tool_result("u1", "2026-09-18T10:00:01.000Z"),
+            cc_assistant("a2", "msg_X", 152, "2026-09-18T10:00:02.000Z"),
+        ];
+
+        // Daemon runs, captures the first two lines, then restarts.
+        let mut before = MessageEnricher::new(HarnessKind::ClaudeCode);
+        capture_all(&sink, &mut before, &session, &lines[..2]).await;
+        let mut after = seeded(&sink, HarnessKind::ClaudeCode, &session).await;
+        capture_all(&sink, &mut after, &session, &lines[2..]).await;
+
+        let handle = after.handle(&session);
+        assert_eq!(output_of(&sink, &handle).await, 152, "one model call, counted once");
+    }
+
+    /// Usage dedupe only compares against the immediately previous usage-bearing turn, so rows of
+    /// one model call split by another call's rows (A, B, A) count A twice. The reasoning-token
+    /// gate in Sink::append handles the same interleaving via the sidecar; usage does not.
+    #[rstest]
+    #[tokio::test]
+    async fn repro_interleaved_turns_double_count_usage(#[future] sink: Sink) {
+        let sink = sink.await;
+        let session = SessionId::from("s1".to_owned());
+        let mut enricher = MessageEnricher::new(HarnessKind::ClaudeCode);
+        capture_all(&sink, &mut enricher, &session, &[
+            cc_assistant("a1", "msg_A", 10, "2026-09-18T10:00:00.000Z"),
+            cc_assistant("b1", "msg_B", 5, "2026-09-18T10:00:01.000Z"),
+            cc_assistant("a2", "msg_A", 10, "2026-09-18T10:00:02.000Z"),
+        ])
+        .await;
+        assert_eq!(output_of(&sink, &enricher.handle(&session)).await, 15);
+    }
+
+    /// When the split rows of one call report growing usage (streamed snapshots), the first row
+    /// wins and the final, larger count is discarded. ccusage keeps the largest duplicate
+    /// (`should_replace_deduped_entry`, test `dedupes_requestless_usage_from_same_session_at_
+    /// distinct_timestamps`: output 25 then 250 -> 250).
+    #[rstest]
+    #[tokio::test]
+    async fn repro_split_rows_keep_first_not_final_usage(#[future] sink: Sink) {
+        let sink = sink.await;
+        let session = SessionId::from("s1".to_owned());
+        let mut enricher = MessageEnricher::new(HarnessKind::ClaudeCode);
+        capture_all(&sink, &mut enricher, &session, &[
+            cc_assistant("a1", "msg_A", 25, "2026-09-18T10:00:00.000Z"),
+            cc_assistant("a2", "msg_A", 250, "2026-09-18T10:00:01.000Z"),
+        ])
+        .await;
+        assert_eq!(output_of(&sink, &enricher.handle(&session)).await, 250);
+    }
+
+    /// Id-less lines are content-addressed by (timestamp, role, content, title) only. Two Codex
+    /// `token_usage_record` lines written in the same millisecond (rollout timestamps are ms
+    /// precision) with different usage collide, and the second is dropped as a duplicate.
+    #[rstest]
+    #[tokio::test]
+    async fn repro_idless_lines_in_same_ms_collide_and_lose_usage(#[future] sink: Sink) {
+        let sink = sink.await;
+        let session = SessionId::from("s1".to_owned());
+        let usage = |response: &str, output: u64| {
+            codex(serde_json::json!({
+                "type": "token_usage_record", "timestamp": "2026-09-18T10:00:00.123Z",
+                "payload": {"turn_id": "t1", "response_id": response,
+                    "usage": {"input_tokens": 1, "output_tokens": output}},
+            }))
+        };
+        let mut enricher = MessageEnricher::new(HarnessKind::Codex);
+        let outcomes =
+            capture_all(&sink, &mut enricher, &session, &[usage("r1", 5), usage("r2", 7)]).await;
+        assert_eq!(outcomes, vec![Appended::New, Appended::New]);
+        assert_eq!(output_of(&sink, &enricher.handle(&session)).await, 12);
+    }
+
+    /// Two distinct id-less user prompts with identical text in the same millisecond (e.g. a
+    /// Codex rollout replaying history in one burst) collapse into one row.
+    #[rstest]
+    #[tokio::test]
+    async fn repro_idless_identical_prompts_in_same_ms_collapse(#[future] sink: Sink) {
+        let sink = sink.await;
+        let session = SessionId::from("s1".to_owned());
+        let prompt = || {
+            codex(serde_json::json!({
+                "type": "response_item", "timestamp": "2026-09-18T10:00:00.123Z",
+                "payload": {"type": "message", "role": "user",
+                    "content": [{"type": "input_text", "text": "continue"}]},
+            }))
+        };
+        let mut enricher = MessageEnricher::new(HarnessKind::Codex);
+        capture_all(&sink, &mut enricher, &session, &[prompt(), prompt()]).await;
+        let handle = enricher.handle(&session);
+        assert_eq!(sink.sidecar.get_session(&handle).await.unwrap().unwrap().message_count, 2);
+    }
+
+    /// Pi `forkFrom` / `createBranchedSession` copy every entry verbatim (same ids, same usage)
+    /// into a new session file whose header names `parentSession`
+    /// (pi-mono packages/coding-agent/src/core/session-manager.ts). Dedupe is scoped to one
+    /// session, so the copied model calls are counted again in the fork, and the fork is not
+    /// linked to its parent.
+    #[rstest]
+    #[tokio::test]
+    async fn repro_forked_session_recounts_copied_usage(#[future] sink: Sink) {
+        let sink = sink.await;
+        let entry = serde_json::json!({
+            "type": "message", "id": "m1", "timestamp": "2026-09-18T10:00:00.000Z",
+            "message": {"role": "assistant", "responseId": "resp_1",
+                "content": [{"type": "text", "text": "hi"}],
+                "usage": {"input": 100, "output": 10}},
+        });
+        let parent = SessionId::from("parent".to_owned());
+        let fork = SessionId::from("fork".to_owned());
+        let header = pi(serde_json::json!({
+            "type": "session", "id": "fork", "timestamp": "2026-09-18T11:00:00.000Z",
+            "cwd": "/w", "parentSession": "/sessions/1700000000_parent.jsonl",
+        }));
+        let mut a = MessageEnricher::new(HarnessKind::Pi);
+        capture_all(&sink, &mut a, &parent, &[pi(entry.clone())]).await;
+        let mut b = MessageEnricher::new(HarnessKind::Pi);
+        capture_all(&sink, &mut b, &fork, &[header, pi(entry)]).await;
+
+        let total: u64 = sink
+            .sidecar
+            .list_sessions(None)
+            .await
+            .unwrap()
+            .iter()
+            .map(|s| s.usage.output.unwrap())
+            .sum();
+        assert_eq!(total, 10, "one billed model call across parent and fork");
+        let fork_row = sink.sidecar.get_session(&b.handle(&fork)).await.unwrap().unwrap();
+        assert!(fork_row.parent.is_some(), "fork is linked to its parent session");
+    }
+
+    /// Claude Code's compaction summary (`isCompactSummary`) is model-written conversation
+    /// text, but the parser maps it to Role::System and sanitize_message drops all non
+    /// user/assistant text, so the summary is lost entirely.
+    #[rstest]
+    fn repro_compact_summary_text_is_dropped() {
+        let m = ccode(serde_json::json!({
+            "type": "user", "uuid": "c1", "isCompactSummary": true,
+            "timestamp": "2026-09-18T10:00:00.000Z",
+            "message": {"role": "user", "content": "This session is being continued... Summary: X"},
+        }));
+        let mut msg = MessageEnricher::new(HarnessKind::ClaudeCode)
+            .capture(&SessionId::from("s1".to_owned()), &m)
+            .unwrap();
+        sanitize_message(&mut msg);
+        assert!(!msg.content.is_empty(), "summary text retained");
+    }
+
+    /// Execution payloads that Claude Code records as user text (`<local-command-stdout>`,
+    /// stripped as such by codex-rs external-agent-migration/src/sessions/title.rs) pass
+    /// sanitize_message untouched and are synced.
+    #[rstest]
+    fn repro_local_command_stdout_survives_sanitize() {
+        let m = ccode(serde_json::json!({
+            "type": "user", "uuid": "c1", "timestamp": "2026-09-18T10:00:00.000Z",
+            "message": {"role": "user", "content":
+                "<local-command-stdout>PRIVATE_OUTPUT</local-command-stdout>"},
+        }));
+        let mut msg = MessageEnricher::new(HarnessKind::ClaudeCode)
+            .capture(&SessionId::from("s1".to_owned()), &m)
+            .unwrap();
+        sanitize_message(&mut msg);
+        assert!(
+            !format!("{:?}", msg.content).contains("PRIVATE_OUTPUT"),
+            "command output is an execution payload"
+        );
+    }
+
+    /// A row that precedes every timestamped line (Claude Code `ai-title` et al.) is
+    /// stamped with capture time, so an imported old session gets updated_at = now.
+    #[rstest]
+    #[tokio::test]
+    async fn repro_untimed_first_row_stamped_with_capture_time(#[future] sink: Sink) {
+        let sink = sink.await;
+        let session = SessionId::from("s1".to_owned());
+        let mut enricher = MessageEnricher::new(HarnessKind::ClaudeCode);
+        capture_all(&sink, &mut enricher, &session, &[
+            ccode(serde_json::json!({"type": "ai-title", "aiTitle": "Old work"})),
+            cc_assistant("a1", "msg_A", 10, "2020-01-01T00:00:00.000Z"),
+        ])
+        .await;
+        let row = sink.sidecar.get_session(&enricher.handle(&session)).await.unwrap().unwrap();
+        assert!(row.updated_at.year() == 2020, "updated_at = {}", row.updated_at);
+    }
+}
