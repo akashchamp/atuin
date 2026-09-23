@@ -190,28 +190,68 @@ impl Session for CcodeSession {
     }
 }
 
+/// One line of a Claude Code transcript (`~/.claude/projects/<project>/<session>.jsonl`).
+///
+/// Loosely typed fields stay [`serde_json::Value`]: a line whose shape a newer Claude Code
+/// changed must still parse.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CcodeMessage {
     #[serde(rename = "type")]
     kind: String,
+    subtype: Option<String>,
     uuid: Option<String>,
     timestamp: Option<String>,
     message: Option<serde_json::Value>,
     content: Option<serde_json::Value>,
     cwd: Option<PathBuf>,
-    #[serde(rename = "gitBranch")]
     git_branch: Option<String>,
-    #[serde(rename = "aiTitle")]
     ai_title: Option<String>,
-    #[serde(rename = "customTitle")]
     custom_title: Option<String>,
-    #[serde(rename = "parentUuid")]
+    /// The title of a legacy `summary` line.
+    summary: Option<Box<serde_json::Value>>,
     parent_uuid: Option<String>,
-    #[serde(rename = "sessionId")]
+    /// The predecessor of a line written with a null `parentUuid`: a `compact_boundary`.
+    logical_parent_uuid: Option<String>,
     session_id: Option<String>,
-    #[serde(rename = "isCompactSummary")]
+    /// `{sessionId, messageUuid}` on every line `/branch` (`--fork-session`) copied.
+    forked_from: Option<Box<serde_json::Value>>,
+    attachment: Option<Box<serde_json::Value>>,
+    /// Who submitted a user line: absent or `{"kind": "human"}` for the user.
+    origin: Option<Box<serde_json::Value>>,
+    is_meta: Option<bool>,
     is_compact_summary: Option<bool>,
+    is_api_error_message: Option<bool>,
+    /// The error class of an API error line (`rate_limit`, `unknown`, ...).
+    error: Option<Box<serde_json::Value>>,
 }
+
+/// The model Claude Code names on the assistant lines it writes itself (API errors, canned
+/// replies): no model produced them.
+const SYNTHETIC_MODEL: &str = "<synthetic>";
+
+/// Tags wrapping output Claude Code captured from a command the user ran (`!cmd`, `/cmd`):
+/// execution payload, never text anyone typed.
+const OUTPUT_TAGS: [&str; 5] = [
+    "local-command-stdout",
+    "local-command-stderr",
+    "bash-stdout",
+    "bash-stderr",
+    "bash-exit-code",
+];
+
+/// Prefixes of user-role text that Claude Code wrote itself (its own `MN` / `jy`
+/// classification): command output, background task notifications, the local-command caveat.
+const INJECTED_PREFIXES: [&str; 8] = [
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "<bash-stdout>",
+    "<bash-stderr>",
+    "<local-command-caveat>",
+    "<task-notification>",
+    "<tick>",
+    "[Request interrupted by user",
+];
 
 fn ccode_stop_reason(raw: &str) -> StopReason {
     match raw {
@@ -221,6 +261,71 @@ fn ccode_stop_reason(raw: &str) -> StopReason {
         "stop_sequence" => StopReason::StopSequence,
         "refusal" => StopReason::Refusal,
         other => StopReason::Other(other.to_owned()),
+    }
+}
+
+/// The text between the first `<name>` and its `</name>`, or `None` without both.
+fn tag<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let start = text.find(&open)? + open.len();
+    let len = text[start..].find(&close)?;
+    Some(&text[start..start + len])
+}
+
+/// `text` without any [`OUTPUT_TAGS`] element; an unclosed one runs to the end.
+fn strip_output(text: &str) -> String {
+    let mut out = text.to_owned();
+    for name in OUTPUT_TAGS {
+        let open = format!("<{name}>");
+        let close = format!("</{name}>");
+        while let Some(start) = out.find(&open) {
+            let end = out[start..].find(&close).map_or(out.len(), |i| start + i + close.len());
+            out.replace_range(start..end, "");
+        }
+    }
+    out
+}
+
+/// A user-role text as the user typed it: command output removed, and a slash command
+/// (`<command-name>`) or bash-mode input (`<bash-input>`) record rendered as its command line,
+/// the way Claude Code itself replays it (`ycr` in CC 2.1.281). `None` when nothing remains.
+fn typed_text(text: &str) -> Option<String> {
+    let text = strip_output(text);
+    let trimmed = text.trim_start();
+    if trimmed.starts_with("<command-") {
+        if let Some(name) = tag(trimmed, "command-name") {
+            let args = tag(trimmed, "command-args").unwrap_or_default().trim();
+            return Some(if args.is_empty() {
+                name.to_owned()
+            } else {
+                format!("{name} {args}")
+            });
+        }
+    } else if trimmed.starts_with("<bash-input>")
+        && let Some(command) = tag(trimmed, "bash-input")
+    {
+        return Some(format!("! {command}"));
+    }
+    (!trimmed.trim_end().is_empty()).then_some(text)
+}
+
+/// Whether a user line's or queued command's `origin` names the user: Claude Code writes none,
+/// or `{"kind": "human"}`, for a prompt the user submitted (`sE` in CC 2.1.281); anything else
+/// (`task-notification`, `peer`, `auto-continuation`, ...) is the harness speaking.
+fn human_origin(origin: Option<&serde_json::Value>) -> bool {
+    origin.is_none_or(|o| o.is_null() || o["kind"].as_str().is_none_or(|kind| kind == "human"))
+}
+
+/// The text of every text block (or a plain string), joined.
+fn joined_text(raw: &serde_json::Value) -> Option<String> {
+    match raw {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Array(blocks) => {
+            let texts: Vec<&str> = blocks.iter().filter_map(|b| b["text"].as_str()).collect();
+            (!texts.is_empty()).then(|| texts.join("\n"))
+        }
+        _ => None,
     }
 }
 
@@ -241,8 +346,84 @@ impl CcodeMessage {
                 output: value["content"].clone(),
                 error: value["is_error"].as_bool().unwrap_or(false),
             }),
+            // Pasted media: keep what it was, not its (base64) bytes.
+            Some(kind @ ("image" | "document")) => Content::Other(serde_json::json!({
+                "type": kind,
+                "source": {
+                    "type": value["source"]["type"],
+                    "media_type": value["source"]["media_type"],
+                },
+            })),
             _ => Content::Other(value.clone()),
         }
+    }
+
+    /// The line's raw content: `message.content`, else the top-level `content` (system lines).
+    fn raw_content(&self) -> Option<&serde_json::Value> {
+        self.message.as_ref().map(|m| &m["content"]).or(self.content.as_ref())
+    }
+
+    /// The line's role as written: `message.role`, else its `type`.
+    fn raw_role(&self) -> &str {
+        self.message.as_ref().and_then(|m| m["role"].as_str()).unwrap_or(self.kind.as_str())
+    }
+
+    /// The text a line opens with, peeked without cloning its blocks.
+    fn first_text(&self) -> Option<&str> {
+        match self.raw_content()? {
+            serde_json::Value::String(text) => Some(text.as_str()),
+            serde_json::Value::Array(blocks) => blocks.first().and_then(|b| b["text"].as_str()),
+            _ => None,
+        }
+    }
+
+    /// A synthetic assistant line Claude Code wrote for a failed API call (`isApiErrorMessage`).
+    fn is_api_error(&self) -> bool {
+        self.is_api_error_message == Some(true)
+    }
+
+    /// Claude Code wrote this assistant line itself (an API error, a canned reply).
+    fn is_synthetic(&self) -> bool {
+        self.is_api_error()
+            || self.message.as_ref().is_some_and(|m| m["model"].as_str() == Some(SYNTHETIC_MODEL))
+    }
+
+    /// A `queued_command` attachment: a prompt delivered while the agent was busy (the user's,
+    /// or a background task's notification).
+    fn queued_command(&self) -> Option<&serde_json::Value> {
+        self.attachment.as_deref().filter(|a| a["type"].as_str() == Some("queued_command"))
+    }
+
+    /// Whether a queued command is one the user typed. Claude Code shows it as the user's turn
+    /// when `commandMode` is `prompt`, it is not `isMeta` and its origin is human (`d8` / `Iie`
+    /// in CC 2.1.281); a task notification has `commandMode: "task-notification"`.
+    fn queued_by_user(queued: &serde_json::Value) -> bool {
+        queued["isMeta"].as_bool() != Some(true)
+            && queued["commandMode"].as_str().is_none_or(|mode| mode == "prompt")
+            && human_origin(queued.get("origin"))
+    }
+
+    /// A user-role line Claude Code wrote itself rather than the user typing it.
+    fn injected_user_line(&self) -> bool {
+        self.is_meta == Some(true)
+            || !human_origin(self.origin.as_deref())
+            || self.first_text().is_some_and(|text| {
+                let text = text.trim_start();
+                INJECTED_PREFIXES.iter().any(|prefix| text.starts_with(prefix))
+            })
+    }
+
+    /// A `local_command` system line recording the slash command the user typed (as opposed
+    /// to its output, written as another `local_command` line).
+    fn typed_local_command(&self) -> bool {
+        self.kind == "system"
+            && self.subtype.as_deref() == Some("local_command")
+            && self.first_text().is_some_and(|text| text.trim_start().starts_with("<command-"))
+    }
+
+    /// Thinking tokens the call reported (`usage.output_tokens_details.thinking_tokens`).
+    fn thinking_tokens(&self) -> Option<u64> {
+        self.message.as_ref()?["usage"]["output_tokens_details"]["thinking_tokens"].as_u64()
     }
 }
 
@@ -252,12 +433,21 @@ impl Message for CcodeMessage {
     }
 
     fn role(&self) -> Role {
+        if self.kind == "attachment" {
+            return match self.queued_command() {
+                Some(queued) if Self::queued_by_user(queued) => Role::User,
+                Some(_) => Role::System,
+                None => Role::Other(self.kind.clone()),
+            };
+        }
         if self.is_compact_summary == Some(true) {
             return Role::System;
         }
-        let role =
-            self.message.as_ref().and_then(|m| m["role"].as_str()).unwrap_or(self.kind.as_str());
-        match role {
+        if self.typed_local_command() {
+            return Role::User;
+        }
+        match self.raw_role() {
+            "user" if self.injected_user_line() => Role::System,
             "user" => Role::User,
             "assistant" => Role::Assistant,
             "system" => Role::System,
@@ -271,60 +461,100 @@ impl Message for CcodeMessage {
     }
 
     fn content(&self) -> Vec<Content> {
-        let raw = self.message.as_ref().map(|m| &m["content"]).or(self.content.as_ref());
+        if let Some(queued) = self.queued_command() {
+            return match &queued["prompt"] {
+                serde_json::Value::String(text) => {
+                    typed_text(text).map(Content::Text).into_iter().collect()
+                }
+                serde_json::Value::Array(blocks) => blocks.iter().map(Self::block).collect(),
+                _ => Vec::new(),
+            };
+        }
+        let Some(raw) = self.raw_content() else {
+            return Vec::new();
+        };
+        if self.is_compact_summary == Some(true) {
+            return joined_text(raw).map(Content::Summary).into_iter().collect();
+        }
+        if self.is_api_error() {
+            let text =
+                joined_text(raw).or_else(|| self.error.as_ref()?.as_str().map(str::to_owned));
+            return text.map(Content::Error).into_iter().collect();
+        }
+        // Everything but model output can hold a record of a command the user ran.
+        let typed = self.raw_role() != "assistant";
+        let text = |text: &str| {
+            if typed {
+                typed_text(text).map(Content::Text)
+            } else {
+                Some(Content::Text(text.to_owned()))
+            }
+        };
         let mut content: Vec<_> = match raw {
-            Some(serde_json::Value::String(text)) => vec![Content::Text(text.clone())],
-            Some(serde_json::Value::Array(blocks)) => blocks.iter().map(Self::block).collect(),
+            serde_json::Value::String(s) => text(s).into_iter().collect(),
+            serde_json::Value::Array(blocks) => blocks
+                .iter()
+                .filter_map(|block| match block["type"].as_str() {
+                    Some("text") => text(block["text"].as_str().unwrap_or_default()),
+                    _ => Some(Self::block(block)),
+                })
+                .collect(),
             _ => Vec::new(),
         };
-        // Usage may arrive on a later text/tool row, independently of the thinking block.
-        // The capture engine deduplicates these model-call totals across split rows.
-        let reported = self
-            .message
-            .as_ref()
-            .and_then(|m| m["usage"]["output_tokens_details"]["thinking_tokens"].as_u64());
+        // One reasoning marker per thinking block, so a call split over several lines is
+        // marked on the line that did the thinking only. The call's thinking tokens (repeated
+        // on every line; the capture engine counts them once per call) ride on that marker.
         if let Some(Content::ReasoningSummary { tokens }) =
             content.iter_mut().find(|block| matches!(block, Content::ReasoningSummary { .. }))
         {
-            *tokens = reported;
-        } else if reported.is_some_and(|n| n > 0) {
-            content.push(Content::ReasoningSummary { tokens: reported });
+            *tokens = self.thinking_tokens();
         }
         content
     }
 
     fn model(&self) -> Option<String> {
+        if self.is_synthetic() {
+            return None;
+        }
         self.message.as_ref()?.get("model")?.as_str().map(str::to_owned)
     }
 
     fn usage(&self) -> Option<Usage> {
+        // A line Claude Code wrote itself made no API call; its zeroed usage is not one.
+        if self.is_synthetic() {
+            return None;
+        }
         let usage = self.message.as_ref()?.get("usage")?;
         if usage.is_null() {
             return None;
         }
+        let field = |name: &str| usage.get(name).and_then(serde_json::Value::as_u64);
+        // The split by cache lifetime, for a writer that leaves out the total.
+        let cache_write = field("cache_creation_input_tokens").or_else(|| {
+            let split = usage.get("cache_creation")?.as_object()?;
+            split.values().filter_map(serde_json::Value::as_u64).reduce(|a, b| a + b)
+        });
         Some(Usage {
-            input: usage.get("input_tokens").and_then(serde_json::Value::as_u64),
-            output: usage.get("output_tokens").and_then(serde_json::Value::as_u64),
-            cache_read: usage.get("cache_read_input_tokens").and_then(serde_json::Value::as_u64),
-            cache_write: usage
-                .get("cache_creation_input_tokens")
-                .and_then(serde_json::Value::as_u64),
+            input: field("input_tokens"),
+            output: field("output_tokens"),
+            cache_read: field("cache_read_input_tokens"),
+            cache_write,
         })
     }
 
     fn stop_reason(&self) -> Option<StopReason> {
-        // An interrupt is recorded as a user line; it is the turn that it ends. Peeked from the
-        // raw JSON rather than `content()`, which would clone every block to read one string.
-        let message = self.message.as_ref()?;
-        let first_text = match &message["content"] {
-            serde_json::Value::String(text) => Some(text.as_str()),
-            serde_json::Value::Array(blocks) => blocks.first().and_then(|b| b["text"].as_str()),
-            _ => None,
-        };
-        if first_text.is_some_and(|t| t.trim_start().starts_with("[Request interrupted by user")) {
+        if self.is_api_error() {
+            return Some(StopReason::Error);
+        }
+        // An interrupt is recorded as a user line; it is the turn that it ends.
+        if self.raw_role() == "user"
+            && self
+                .first_text()
+                .is_some_and(|t| t.trim_start().starts_with("[Request interrupted by user"))
+        {
             return Some(StopReason::Aborted);
         }
-        Some(ccode_stop_reason(message.get("stop_reason")?.as_str()?))
+        Some(ccode_stop_reason(self.message.as_ref()?.get("stop_reason")?.as_str()?))
     }
 
     fn cwd(&self) -> Option<PathBuf> {
@@ -336,19 +566,36 @@ impl Message for CcodeMessage {
     }
 
     fn parent_id(&self) -> Option<MessageId> {
-        self.parent_uuid.clone().map(MessageId::from)
+        self.parent_uuid.clone().or_else(|| self.logical_parent_uuid.clone()).map(MessageId::from)
     }
 
+    /// The session a fork was copied from (`forkedFrom`), else the session the line names: a
+    /// subagent's (or `/btw` side question's) lines name the session that spawned it.
     fn parent_session(&self) -> Option<SessionId> {
-        self.session_id.clone().map(SessionId::from)
+        self.forked_from
+            .as_ref()
+            .and_then(|f| f["sessionId"].as_str())
+            .map(str::to_owned)
+            .or_else(|| self.session_id.clone())
+            .map(SessionId::from)
     }
 
+    /// The API message id: one per model call, shared by every line the response is split
+    /// into, and kept when Claude Code copies the line into a fork or a `/btw` replay.
     fn turn_id(&self) -> Option<String> {
+        if self.is_synthetic() {
+            return None;
+        }
         self.message.as_ref()?.get("id")?.as_str().map(str::to_owned)
     }
 
     fn title(&self) -> Option<String> {
-        self.custom_title.clone().or_else(|| self.ai_title.clone())
+        let summary = || {
+            (self.kind == "summary")
+                .then(|| self.summary.as_ref()?.as_str().map(str::to_owned))
+                .flatten()
+        };
+        self.custom_title.clone().or_else(|| self.ai_title.clone()).or_else(summary)
     }
 }
 
@@ -766,47 +1013,75 @@ mod tests {
         assert!(tool_uses >= 1, "expected at least one normalized tool_use");
         assert!(tool_results >= 1, "expected at least one normalized tool_result");
     }
-}
-
-/// Audit repros: each test asserts the *expected* behaviour and currently fails.
-#[cfg(test)]
-mod repro {
-    use rstest::rstest;
-
-    use super::*;
 
     fn parse(raw: &serde_json::Value) -> CcodeMessage {
         serde_json::from_str(&raw.to_string()).unwrap()
     }
 
     /// Legacy `summary` lines carry the session title Claude Code's `/resume` shows
-    /// (`r.set(kn.leafUuid, kn.summary)` in CC 2.1.281); the parser never reads `summary`.
+    /// (`r.set(kn.leafUuid, kn.summary)` in CC 2.1.281).
     #[rstest]
-    fn repro_summary_line_exposes_its_title() {
+    fn summary_line_exposes_its_title() {
         let m = parse(&serde_json::json!({
             "type": "summary", "summary": "Fix the flaky sync test", "leafUuid": "u9",
         }));
         assert_eq!(m.title().as_deref(), Some("Fix the flaky sync test"));
+        assert!(m.content().is_empty());
     }
 
-    /// A prompt the user types while the agent is busy is written only as an `attachment` line
-    /// of type `queued_command` (`attachment.prompt`); CC treats it as a human turn.
+    /// A prompt the user types while the agent is busy is written only as a `queued_command`
+    /// attachment (`attachment.prompt`); Claude Code treats it as the user's turn.
     #[rstest]
-    fn repro_queued_command_attachment_keeps_user_text() {
+    #[case::origin_human(serde_json::json!({"origin": {"kind": "human"}}))]
+    #[case::prompt_mode(serde_json::json!({"commandMode": "prompt"}))]
+    fn queued_prompt_is_user_text(#[case] extra: serde_json::Value) {
+        let mut attachment =
+            serde_json::json!({"type": "queued_command", "prompt": "also check forks please"});
+        attachment.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
         let m = parse(&serde_json::json!({
             "type": "attachment", "uuid": "a1", "parentUuid": "u0", "sessionId": "s",
-            "timestamp": "2026-09-23T22:44:00Z",
-            "attachment": {"type": "queued_command", "prompt": "also check forks please",
-                "origin": {"kind": "human"}},
+            "timestamp": "2026-09-23T22:44:00Z", "attachment": attachment,
         }));
         assert_eq!(m.role(), Role::User);
         assert_eq!(m.content(), vec![Content::Text("also check forks please".into())]);
     }
 
-    /// `compact_boundary` lines are written with `parentUuid: null` and the real predecessor in
-    /// `logicalParentUuid`; the parser drops it, so the tree breaks at every compaction.
+    /// Background task results are delivered through the same queue; they are not the user's.
     #[rstest]
-    fn repro_compact_boundary_keeps_its_logical_parent() {
+    #[case::task_notification(serde_json::json!({"commandMode": "task-notification"}))]
+    #[case::peer(serde_json::json!({"origin": {"kind": "peer", "from": "a1"}}))]
+    #[case::meta(serde_json::json!({"isMeta": true}))]
+    fn queued_harness_message_is_system(#[case] extra: serde_json::Value) {
+        let mut attachment = serde_json::json!({"type": "queued_command",
+            "prompt": "<task-notification>\n<task-id>b1</task-id>\n</task-notification>"});
+        attachment.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let m = parse(&serde_json::json!({"type": "attachment", "uuid": "a1",
+            "attachment": attachment}));
+        assert_eq!(m.role(), Role::System);
+    }
+
+    /// `queue-operation` lines are Claude Code's queue bookkeeping. `remove` records a command
+    /// leaving the queue, whether delivered or discarded (`cr(..., commandsDiscarded)` in CC
+    /// 2.1.281), and is written for task notifications too. claude-code-log renders it as
+    /// steering only for Claude Code before ~2.1.101; later versions write a `queued_command`
+    /// attachment for each delivery, which is where the user's text is taken from. Reading
+    /// `remove` as user text would capture it twice.
+    #[rstest]
+    #[case("remove")]
+    #[case("enqueue")]
+    #[case("popAll")]
+    fn queue_operation_is_not_user_text(#[case] operation: &str) {
+        let m = parse(&serde_json::json!({
+            "type": "queue-operation", "operation": operation, "sessionId": "s",
+            "timestamp": "2026-09-23T22:44:00Z", "content": "stop and use rstest",
+        }));
+        assert_ne!(m.role(), Role::User);
+    }
+
+    /// `compact_boundary` lines are written with `parentUuid: null` and the real predecessor in
+    /// `logicalParentUuid`.
+    #[rstest]
+    fn compact_boundary_keeps_its_logical_parent() {
         let m = parse(&serde_json::json!({
             "type": "system", "subtype": "compact_boundary", "uuid": "b1",
             "parentUuid": null, "logicalParentUuid": "u41",
@@ -815,10 +1090,22 @@ mod repro {
         assert_eq!(m.parent_id(), Some(MessageId::from("u41".to_owned())));
     }
 
-    /// `/branch` (`--fork-session`) copies each line with `sessionId` rewritten to the new session
-    /// and the origin in `forkedFrom.sessionId`; the parser only reads `sessionId`.
+    /// The compaction summary is the only record of the conversation it replaced.
     #[rstest]
-    fn repro_forked_line_names_the_session_it_was_forked_from() {
+    #[case(serde_json::json!("Summary: fixed forks"))]
+    #[case(serde_json::json!([{"type": "text", "text": "Summary: fixed forks"}]))]
+    fn compact_summary_is_a_summary(#[case] content: serde_json::Value) {
+        let m = parse(&serde_json::json!({
+            "type": "user", "uuid": "c1", "isCompactSummary": true,
+            "message": {"role": "user", "content": content},
+        }));
+        assert_eq!(m.content(), vec![Content::Summary("Summary: fixed forks".into())]);
+    }
+
+    /// `/branch` (`--fork-session`) copies each line with `sessionId` rewritten to the new session
+    /// and the origin in `forkedFrom.sessionId`.
+    #[rstest]
+    fn forked_line_names_the_session_it_was_forked_from() {
         let m = parse(&serde_json::json!({
             "type": "user", "uuid": "u1", "parentUuid": null, "sessionId": "new",
             "forkedFrom": {"sessionId": "old", "messageUuid": "u1"},
@@ -828,9 +1115,9 @@ mod repro {
     }
 
     /// Synthetic API-error assistant lines (`isApiErrorMessage`, model `<synthetic>`,
-    /// `stop_reason: "stop_sequence"`, zero usage) are reported as a real model and a normal stop.
+    /// `stop_reason: "stop_sequence"`, zero usage) are a failed call, not a model's reply.
     #[rstest]
-    fn repro_api_error_line_is_an_error_not_a_synthetic_model() {
+    fn api_error_line_is_an_error_not_a_synthetic_model() {
         let m = parse(&serde_json::json!({
             "type": "assistant", "uuid": "e1", "isApiErrorMessage": true,
             "error": "rate_limit",
@@ -842,45 +1129,134 @@ mod repro {
         }));
         assert_eq!(m.stop_reason(), Some(StopReason::Error));
         assert_eq!(m.model(), None, "`<synthetic>` is not a model");
+        assert_eq!(m.usage(), None);
+        assert_eq!(m.turn_id(), None);
+        assert_eq!(m.content(), vec![Content::Error("API Error: 529 Overloaded".into())]);
     }
 
-    /// `isMeta` user lines are harness-injected (e.g. `<local-command-caveat>`), not typed by
-    /// the user, but are reported as user conversation text.
+    /// Lines Claude Code writes into the user's side of the conversation are not user text.
     #[rstest]
-    fn repro_meta_user_line_is_not_user_text() {
-        let m = parse(&serde_json::json!({
-            "type": "user", "uuid": "m1", "isMeta": true,
-            "message": {"role": "user", "content": "<local-command-caveat>Caveat: The messages below were generated by the user while running local commands.</local-command-caveat>"},
-        }));
-        assert_ne!(m.role(), Role::User);
+    #[case::meta(serde_json::json!({"isMeta": true,
+        "message": {"role": "user", "content": "<local-command-caveat>Caveat</local-command-caveat>"}}))]
+    #[case::task_notification(serde_json::json!({"origin": {"kind": "task-notification"},
+        "message": {"role": "user", "content": "<task-notification>done</task-notification>"}}))]
+    #[case::peer(serde_json::json!({"origin": {"kind": "peer"},
+        "message": {"role": "user", "content": "<agent-message>report</agent-message>"}}))]
+    #[case::command_output(serde_json::json!({
+        "message": {"role": "user", "content": "<local-command-stdout>ok</local-command-stdout>"}}))]
+    #[case::interrupt(serde_json::json!({
+        "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]}}))]
+    fn injected_user_line_is_system(#[case] extra: serde_json::Value) {
+        let mut raw = serde_json::json!({"type": "user", "uuid": "m1"});
+        raw.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        assert_eq!(parse(&raw).role(), Role::System);
     }
 
-    /// A line holding only a tool_use block gains a `ReasoningSummary` because the call's usage
-    /// (repeated on every split line) reports thinking tokens.
+    /// Command output never leaves the parser; the command the user typed does, as they typed it.
     #[rstest]
-    fn repro_tool_use_only_line_gains_no_reasoning_block() {
-        let m = parse(&serde_json::json!({
+    #[case::stdout("<local-command-stdout>PRIVATE</local-command-stdout>", vec![])]
+    #[case::stderr("<local-command-stderr>PRIVATE</local-command-stderr>", vec![])]
+    #[case::bash_output(
+        "<bash-stdout>PRIVATE</bash-stdout><bash-stderr></bash-stderr><bash-exit-code>0</bash-exit-code>",
+        vec![]
+    )]
+    #[case::slash_command(
+        "<command-name>/model</command-name>\n  <command-message>model</command-message>\n  <command-args>opus</command-args>",
+        vec![Content::Text("/model opus".into())]
+    )]
+    #[case::slash_command_without_args(
+        "<command-message>login</command-message>\n<command-name>/login</command-name>\n<command-args></command-args>",
+        vec![Content::Text("/login".into())]
+    )]
+    #[case::bash_input("<bash-input>ls -la</bash-input>", vec![Content::Text("! ls -la".into())])]
+    #[case::inline_output(
+        "see <local-command-stdout>PRIVATE</local-command-stdout>this",
+        vec![Content::Text("see this".into())]
+    )]
+    #[case::unclosed_output("hi <bash-stdout>PRIVATE", vec![Content::Text("hi ".into())])]
+    fn user_text_is_what_the_user_typed(#[case] text: &str, #[case] expected: Vec<Content>) {
+        let m = parse(&serde_json::json!({"type": "user", "uuid": "c1",
+            "message": {"role": "user", "content": text}}));
+        assert_eq!(m.content(), expected);
+    }
+
+    /// Claude Code also records a typed slash command as a `local_command` system line.
+    #[rstest]
+    fn local_command_record_is_user_text() {
+        let m = parse(&serde_json::json!({"type": "system", "subtype": "local_command",
+            "uuid": "l1", "content": "<command-name>/cost</command-name><command-args></command-args>"}));
+        assert_eq!(m.role(), Role::User);
+        assert_eq!(m.content(), vec![Content::Text("/cost".into())]);
+
+        let output = parse(&serde_json::json!({"type": "system", "subtype": "local_command",
+            "uuid": "l2", "content": "<local-command-stdout>$0.12</local-command-stdout>"}));
+        assert_eq!(output.role(), Role::System);
+        assert!(output.content().is_empty());
+    }
+
+    fn assistant_line(blocks: &serde_json::Value, usage: &serde_json::Value) -> CcodeMessage {
+        parse(&serde_json::json!({
             "type": "assistant", "uuid": "t1",
-            "message": {"id": "msg_01", "role": "assistant",
-                "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}],
-                "usage": {"input_tokens": 2, "output_tokens": 206,
-                    "output_tokens_details": {"thinking_tokens": 21}}},
-        }));
+            "message": {"id": "msg_01", "role": "assistant", "content": blocks, "usage": usage},
+        }))
+    }
+
+    /// A call split over several lines repeats its usage on each; only the line with the
+    /// thinking block is marked as reasoning.
+    #[rstest]
+    #[case::tool_use(serde_json::json!([{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}]))]
+    #[case::text(serde_json::json!([{"type": "text", "text": "done"}]))]
+    fn split_line_without_thinking_gains_no_reasoning_block(#[case] blocks: serde_json::Value) {
+        let usage = serde_json::json!({"input_tokens": 2, "output_tokens": 206,
+            "output_tokens_details": {"thinking_tokens": 21}});
+        let content = assistant_line(&blocks, &usage).content();
         assert!(
-            !m.content().iter().any(|c| matches!(c, Content::ReasoningSummary { .. })),
-            "{:?}",
-            m.content()
+            !content.iter().any(|c| matches!(c, Content::ReasoningSummary { .. })),
+            "{content:?}"
         );
     }
 
-    /// Steering input (`queue-operation` `remove`, per claude-code-log) is user text but is
-    /// reported under an `Other` role, which downstream strips.
     #[rstest]
-    fn repro_queue_operation_steering_is_user_text() {
-        let m = parse(&serde_json::json!({
-            "type": "queue-operation", "operation": "remove", "sessionId": "s",
-            "timestamp": "2026-09-23T22:44:00Z", "content": "stop and use rstest",
-        }));
+    #[case::final_usage(serde_json::json!({"output_tokens": 206,
+        "output_tokens_details": {"thinking_tokens": 21}}), Some(21))]
+    // Subagent transcripts write the thinking line with the stream's opening usage.
+    #[case::opening_usage(serde_json::json!({"output_tokens": 5}), None)]
+    fn thinking_line_carries_the_calls_thinking_tokens(
+        #[case] usage: serde_json::Value,
+        #[case] expected: Option<u64>,
+        #[values("thinking", "redacted_thinking")] kind: &str,
+    ) {
+        let blocks = serde_json::json!([{"type": kind}]);
+        assert_eq!(assistant_line(&blocks, &usage).content(), vec![Content::ReasoningSummary {
+            tokens: expected
+        }]);
+    }
+
+    #[rstest]
+    #[case::total(serde_json::json!({"cache_creation_input_tokens": 7,
+        "cache_creation": {"ephemeral_5m_input_tokens": 3, "ephemeral_1h_input_tokens": 1}}), Some(7))]
+    #[case::split_only(serde_json::json!({
+        "cache_creation": {"ephemeral_5m_input_tokens": 3, "ephemeral_1h_input_tokens": 4}}), Some(7))]
+    #[case::neither(serde_json::json!({"input_tokens": 1}), None)]
+    fn cache_write_falls_back_to_the_lifetime_split(
+        #[case] usage: serde_json::Value,
+        #[case] expected: Option<u64>,
+    ) {
+        let usage = assistant_line(&serde_json::json!([]), &usage).usage().unwrap();
+        assert_eq!(usage.cache_write, expected);
+    }
+
+    #[rstest]
+    fn image_blocks_drop_their_bytes() {
+        let m = parse(&serde_json::json!({"type": "user", "uuid": "i1",
+        "message": {"role": "user", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+                "data": "PRIVATE_BYTES"}},
+            {"type": "text", "text": "what is this?"},
+        ]}}));
         assert_eq!(m.role(), Role::User);
+        let content = m.content();
+        assert!(!format!("{content:?}").contains("PRIVATE_BYTES"));
+        assert_eq!(content[1], Content::Text("what is this?".into()));
     }
 }
