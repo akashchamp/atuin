@@ -507,6 +507,73 @@ mod tests {
         assert_eq!(first.usage.and_then(|u| u.output), Some(5));
         assert_eq!(second.usage.and_then(|u| u.output), Some(7));
     }
+
+    // ---- Repro tests for the Codex parser audit. Expected to FAIL until the bugs are fixed. ----
+
+    fn codex_usage_record(ts: &str, response: &str, output: u64) -> AnyMessage {
+        codex(&serde_json::json!({
+            "timestamp": ts, "type": "token_usage_record",
+            "payload": {"turn_id": "t1", "response_id": response,
+                "usage": {"input_tokens": 10, "cached_input_tokens": 0, "output_tokens": output}},
+        }))
+    }
+
+    /// `token_usage_record` lines have no top-level `id`, so their source id is the
+    /// timestamp+role+content hash. Usage lines carry no content, so two model calls recorded in
+    /// the same millisecond get one source id and the sink's dedup gate drops the second's usage,
+    /// although each names a distinct `response_id`.
+    #[rstest]
+    fn repro_codex_usage_records_in_one_millisecond_keep_distinct_source_ids() {
+        let ts = "2026-09-18T10:00:00.123Z";
+        let a = codex_usage_record(ts, "resp_a", 5);
+        let b = codex_usage_record(ts, "resp_b", 7);
+        assert_ne!(
+            MessageEnricher::source_id(&session(), &a),
+            MessageEnricher::source_id(&session(), &b),
+            "distinct model calls collapse to one row"
+        );
+    }
+
+    /// A forked rollout copies the parent's rollout items (session_meta, messages,
+    /// token_usage_record, ...) ahead of the child's own (codex-rs `core/src/session/mod.rs`,
+    /// `InitialHistory::Forked` + `ForkPersistence::Copied` -> `persist_rollout_items`). Every
+    /// copied usage record is counted again under the child session.
+    #[rstest]
+    fn repro_codex_forked_rollout_does_not_recount_parent_usage() {
+        let child = SessionId::from("child".to_owned());
+        let lines = [
+            codex(&serde_json::json!({
+                "timestamp": "2026-09-18T11:00:00.000Z", "type": "session_meta",
+                "payload": {"id": "child", "forked_from_id": "parent", "cwd": "/work"},
+            })),
+            // Copied parent history.
+            codex(&serde_json::json!({
+                "timestamp": "2026-09-18T11:00:00.001Z", "type": "session_meta",
+                "payload": {"id": "parent", "cwd": "/work"},
+            })),
+            codex(&serde_json::json!({
+                "timestamp": "2026-09-18T11:00:00.001Z", "type": "response_item",
+                "payload": {"type": "message", "id": "msg_p", "role": "user",
+                    "content": [{"type": "input_text", "text": "parent prompt"}]},
+            })),
+            codex_usage_record("2026-09-18T11:00:00.002Z", "resp_parent", 1_000),
+            codex(&serde_json::json!({
+                "timestamp": "2026-09-18T11:00:00.003Z", "type": "event_msg",
+                "payload": {"type": "thread_settings_applied"},
+            })),
+            // The child's own turn.
+            codex(&serde_json::json!({
+                "timestamp": "2026-09-18T11:00:05.000Z", "type": "response_item",
+                "payload": {"type": "message", "id": "msg_c", "role": "user",
+                    "content": [{"type": "input_text", "text": "child prompt"}]},
+            })),
+            codex_usage_record("2026-09-18T11:00:06.000Z", "resp_child", 7),
+        ];
+        let mut n = MessageEnricher::new(HarnessKind::Codex);
+        let rows: Vec<Message> = lines.iter().filter_map(|m| n.capture(&child, m)).collect();
+        let output: u64 = rows.iter().filter_map(|m| m.usage.and_then(|u| u.output)).sum();
+        assert_eq!(output, 7, "parent usage replayed into the fork is counted again");
+    }
 }
 
 /// Audit repros for the Claude Code parser + enricher: each asserts the expected behaviour and

@@ -727,4 +727,146 @@ mod tests {
         assert!(tool_uses >= 1, "expected at least one normalized tool call");
         assert!(tool_results >= 1, "expected at least one normalized tool result");
     }
+
+    // ---- Repro tests for the Codex parser audit. Expected to FAIL until the bugs are fixed. ----
+
+    fn line(raw: &serde_json::Value) -> CodexMessage {
+        serde_json::from_str(&raw.to_string()).unwrap()
+    }
+
+    fn token_usage(input: u64, cached: u64, output: u64) -> serde_json::Value {
+        serde_json::json!({
+            "input_tokens": input, "cached_input_tokens": cached, "cache_write_input_tokens": 0,
+            "output_tokens": output, "reasoning_output_tokens": 0, "total_tokens": input + output,
+        })
+    }
+
+    /// Rollouts written before `token_usage_record` existed report usage only on
+    /// `event_msg`/`token_count` (`info.last_token_usage` is the per-call delta,
+    /// `info.total_token_usage` the running total). Such a rollout yields no usage at all.
+    #[rstest]
+    fn repro_legacy_token_count_usage_is_captured() {
+        let m = line(&serde_json::json!({
+            "timestamp": "2025-09-18T10:00:00.000Z", "type": "event_msg",
+            "payload": {"type": "token_count", "info": {
+                "total_token_usage": token_usage(30_000, 20_000, 300),
+                "last_token_usage": token_usage(15_000, 10_000, 100),
+                "model_context_window": 258_400,
+            }},
+        }));
+        assert!(m.usage().is_some(), "legacy token_count usage dropped");
+    }
+
+    /// Codex/OpenAI `input_tokens` already includes `cached_input_tokens`
+    /// (codex-rs `TokenUsage::non_cached_input`). Every other harness (Claude Code, Pi) stores
+    /// `input` exclusive of cache reads, so Codex rows overstate input by `cache_read`.
+    #[rstest]
+    fn repro_usage_input_excludes_cached_input() {
+        let m = line(&serde_json::json!({
+            "timestamp": "2026-09-18T10:00:00.000Z", "type": "token_usage_record",
+            "payload": {"turn_id": "t1", "response_id": "resp_1",
+                "usage": token_usage(14_161, 9_984, 123)},
+        }));
+        let usage = m.usage().unwrap();
+        assert_eq!(usage.cache_read, Some(9_984));
+        assert_eq!(usage.input, Some(14_161 - 9_984), "cached input counted as fresh input too");
+    }
+
+    /// `session_meta` carries `git: {commit_hash, branch, repository_url}`
+    /// (codex-rs `SessionMetaLine.git`), but the parser never reads it.
+    #[rstest]
+    fn repro_session_meta_git_branch_is_read() {
+        let m = line(&serde_json::json!({
+            "timestamp": "2026-09-18T10:00:00.000Z", "type": "session_meta",
+            "payload": {"id": "child", "cwd": "/work", "git": {"branch": "main", "commit_hash": "abc"}},
+        }));
+        assert_eq!(m.git_branch().as_deref(), Some("main"));
+    }
+
+    /// A forked or subagent rollout names its origin in `session_meta.forked_from_id` /
+    /// `parent_thread_id` (codex-rs `SessionMeta`); no parent session is reported.
+    #[rstest]
+    #[case("forked_from_id")]
+    #[case("parent_thread_id")]
+    fn repro_session_meta_names_its_parent(#[case] field: &str) {
+        let mut payload = serde_json::json!({"id": "child", "cwd": "/work"});
+        payload[field] = serde_json::json!("parent");
+        let m = line(&serde_json::json!({
+            "timestamp": "2026-09-18T10:00:00.000Z", "type": "session_meta", "payload": payload,
+        }));
+        assert_eq!(m.parent_session(), Some(SessionId::from("parent".to_owned())));
+    }
+
+    /// A `compacted` line carries the compaction summary in `payload.message` (codex-rs
+    /// `CompactedItemWire.message`); it is neither content nor an id, so the line is dropped.
+    #[rstest]
+    fn repro_compacted_summary_is_kept() {
+        let m = line(&serde_json::json!({
+            "timestamp": "2026-09-18T10:00:00.000Z", "type": "compacted",
+            "payload": {"message": "Summary of the conversation so far", "replacement_history": []},
+        }));
+        assert!(
+            m.content().iter().any(|c| matches!(c, Content::Text(t) if t.contains("Summary"))),
+            "compaction summary lost: {:?}",
+            m.content()
+        );
+    }
+
+    /// `turn_complete` persists terminal error details in `payload.error` (codex-rs
+    /// `TurnCompleteEvent.error`); only `turn_aborted` maps to a stop reason.
+    #[rstest]
+    fn repro_turn_complete_with_error_reports_an_error() {
+        let m = line(&serde_json::json!({
+            "timestamp": "2026-09-18T10:00:00.000Z", "type": "event_msg",
+            "payload": {"type": "turn_complete", "turn_id": "t1", "last_agent_message": null,
+                "error": {"message": "stream disconnected before completion", "codex_error_info": null}},
+        }));
+        assert_eq!(m.stop_reason(), Some(StopReason::Error));
+    }
+
+    /// Codex injects AGENTS.md and `<environment_context>` as `role: "user"` messages
+    /// (codex-rs `core/src/context/contextual_user_message.rs`, `is_contextual_user_fragment`).
+    /// They become User turns and, being first, the session preview.
+    #[rstest]
+    #[case("# AGENTS.md instructions for /work\n\n<INSTRUCTIONS>\nbe nice\n</INSTRUCTIONS>")]
+    #[case("<environment_context>\n  <cwd>/work</cwd>\n</environment_context>")]
+    fn repro_contextual_user_messages_are_not_user_turns(#[case] text: &str) {
+        let m = line(&serde_json::json!({
+            "timestamp": "2026-09-18T10:00:00.000Z", "type": "response_item",
+            "payload": {"type": "message", "id": "msg_1", "role": "user",
+                "content": [{"type": "input_text", "text": text}]},
+        }));
+        assert_ne!(m.role(), Role::User, "harness-injected context captured as a user turn");
+    }
+
+    /// `developer` is the Responses API system role; it lands in `Role::Other`.
+    #[rstest]
+    fn repro_developer_role_is_system() {
+        let m = line(&serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "message", "id": "msg_1", "role": "developer",
+                "content": [{"type": "input_text", "text": "<permissions instructions>"}]},
+        }));
+        assert_eq!(m.role(), Role::System);
+    }
+
+    /// Tool calls other than function/custom calls (codex-rs `ResponseItem::LocalShellCall`,
+    /// `WebSearchCall`, `ToolSearchCall`) normalize to an empty `Role::Other("response_item")`
+    /// row instead of a tool use.
+    #[rstest]
+    #[case(serde_json::json!({"type": "local_shell_call", "id": "lsh_1", "call_id": "c1",
+        "status": "completed", "action": {"type": "exec", "command": ["ls"]}}))]
+    #[case(serde_json::json!({"type": "web_search_call", "id": "ws_1", "status": "completed",
+        "action": {"type": "search", "query": "rust"}}))]
+    #[case(serde_json::json!({"type": "tool_search_call", "id": "ts_1", "call_id": "c2",
+        "execution": "server", "arguments": {}}))]
+    fn repro_other_tool_calls_normalize_to_tool_use(#[case] payload: serde_json::Value) {
+        let m = line(&serde_json::json!({"type": "response_item", "payload": payload}));
+        assert_eq!(m.role(), Role::Assistant);
+        assert!(
+            matches!(m.content().as_slice(), [Content::ToolUse(_)]),
+            "tool call lost: {:?}",
+            m.content()
+        );
+    }
 }
