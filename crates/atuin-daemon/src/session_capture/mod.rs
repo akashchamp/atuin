@@ -698,6 +698,28 @@ mod tests {
         assert!(msg.content.is_empty());
     }
 
+    /// Repro (expected to fail): the compaction summary (the only record of the pre-compaction
+    /// conversation) is mapped to `Role::System` by the Claude Code parser, so capture policy
+    /// strips its text and stores an empty row.
+    #[rstest]
+    fn repro_compaction_summary_text_survives_capture() {
+        use atuin_common::harnesstools::ccode::session::CcodeMessage;
+        use atuin_common::harnesstools::session::{AnyMessage, SessionId};
+
+        let raw = serde_json::json!({
+            "type": "user", "uuid": "c1", "parentUuid": "b1", "isCompactSummary": true,
+            "sessionId": "s1", "timestamp": "2026-09-23T22:41:00Z",
+            "message": {"role": "user", "content": "This session is being continued from a previous conversation. Summary: ..."},
+        });
+        let m = AnyMessage::Ccode(serde_json::from_str::<CcodeMessage>(&raw.to_string()).unwrap());
+        let mut msg =
+            crate::session_capture::message_enricher::MessageEnricher::new(HarnessKind::ClaudeCode)
+                .capture(&SessionId::from("s1".to_owned()), &m)
+                .unwrap();
+        sanitize_message(&mut msg);
+        assert!(!msg.content.is_empty(), "compaction summary text was dropped");
+    }
+
     #[rstest]
     #[tokio::test]
     async fn append_returns_new_then_duplicate() {

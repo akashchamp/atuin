@@ -508,3 +508,129 @@ mod tests {
         assert_eq!(second.usage.and_then(|u| u.output), Some(7));
     }
 }
+
+/// Audit repros for the Claude Code parser + enricher: each asserts the expected behaviour and
+/// currently fails.
+#[cfg(test)]
+mod repro {
+    use atuin_common::harnesstools::ccode::session::CcodeMessage;
+    use rstest::rstest;
+
+    use super::*;
+
+    fn ccode(raw: &serde_json::Value) -> AnyMessage {
+        AnyMessage::Ccode(serde_json::from_str::<CcodeMessage>(&raw.to_string()).unwrap())
+    }
+
+    fn assistant(uuid: &str, msg_id: &str, output: u64, extra: serde_json::Value) -> AnyMessage {
+        let mut raw = serde_json::json!({
+            "type": "assistant", "uuid": uuid, "sessionId": "s1", "requestId": format!("req_{msg_id}"),
+            "timestamp": "2026-09-23T22:41:00Z",
+            "message": {"role": "assistant", "id": msg_id, "model": "claude-opus-5-5",
+                "content": [{"type": "text", "text": uuid}],
+                "usage": {"input_tokens": 2, "output_tokens": output,
+                    "cache_read_input_tokens": 1000, "cache_creation_input_tokens": 10}},
+        });
+        raw.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        ccode(&raw)
+    }
+
+    fn total_output(rows: &[Message]) -> u64 {
+        rows.iter().filter_map(|r| r.usage.and_then(|u| u.output)).sum()
+    }
+
+    /// Streaming writes: earlier split lines of one call can carry a smaller `output_tokens`
+    /// than the final one (tokscale: "later entries often carry more complete token counts";
+    /// ccusage keeps the larger duplicate). The enricher keeps the first line's usage.
+    #[rstest]
+    fn repro_split_call_keeps_the_final_usage() {
+        let sid = SessionId::from("s1".to_owned());
+        let mut n = MessageEnricher::new(HarnessKind::ClaudeCode);
+        let rows: Vec<Message> = [
+            assistant("u1", "msg_A", 1, serde_json::json!({})),
+            assistant("u2", "msg_A", 350, serde_json::json!({})),
+        ]
+        .iter()
+        .filter_map(|m| n.capture(&sid, m))
+        .collect();
+        assert_eq!(total_output(&rows), 350);
+    }
+
+    /// Dedupe only compares with the previous usage-bearing line, so a call whose split lines
+    /// are interleaved with another call's lines in the same transcript is counted twice.
+    /// UNVERIFIED format: no interleaving observed in CC 2.1.281 transcripts (subagents live in
+    /// their own files); legacy in-file sidechains may produce it.
+    #[rstest]
+    fn repro_interleaved_calls_count_usage_once() {
+        let sid = SessionId::from("s1".to_owned());
+        let mut n = MessageEnricher::new(HarnessKind::ClaudeCode);
+        let rows: Vec<Message> = [
+            assistant("a1", "msg_A", 100, serde_json::json!({})),
+            assistant("b1", "msg_B", 10, serde_json::json!({"isSidechain": true})),
+            assistant("a2", "msg_A", 100, serde_json::json!({})),
+        ]
+        .iter()
+        .filter_map(|m| n.capture(&sid, m))
+        .collect();
+        assert_eq!(total_output(&rows), 110);
+    }
+
+    /// `/branch` / `--fork-session` copies the original session's lines (same uuid, same
+    /// message.id + requestId + usage, `sessionId` rewritten, origin in `forkedFrom`) into a new
+    /// file; `/btw` side-question files under `subagents/` replay parent messages the same way
+    /// (ccusage #913). Each copy is a new session to the enricher, so its usage is counted again,
+    /// and the fork is not linked to its origin.
+    #[rstest]
+    #[case::fork("new", serde_json::json!({"sessionId": "new",
+        "forkedFrom": {"sessionId": "orig", "messageUuid": "u1"}}))]
+    #[case::btw_replay("agent-aside", serde_json::json!({"sessionId": "orig", "isSidechain": true}))]
+    fn repro_copied_lines_do_not_recount_usage(
+        #[case] copy_session: &str,
+        #[case] extra: serde_json::Value,
+    ) {
+        let orig = SessionId::from("orig".to_owned());
+        let copy = SessionId::from(copy_session.to_owned());
+        let mut n = MessageEnricher::new(HarnessKind::ClaudeCode);
+        let original = n
+            .capture(
+                &orig,
+                &assistant("u1", "msg_A", 100, serde_json::json!({"sessionId": "orig"})),
+            )
+            .unwrap();
+        let copied = n.capture(&copy, &assistant("u1", "msg_A", 100, extra)).unwrap();
+        assert_eq!(total_output(&[original, copied]), 100, "one API call, counted once");
+    }
+
+    #[rstest]
+    fn repro_forked_session_rows_link_to_their_origin() {
+        let copy = SessionId::from("new".to_owned());
+        let mut n = MessageEnricher::new(HarnessKind::ClaudeCode);
+        let row = n
+            .capture(
+                &copy,
+                &assistant(
+                    "u1",
+                    "msg_A",
+                    100,
+                    serde_json::json!({"sessionId": "new",
+                        "forkedFrom": {"sessionId": "orig", "messageUuid": "u1"}}),
+                ),
+            )
+            .unwrap();
+        assert_eq!(row.parent.map(|p| p.session), Some(NativeSessionId::from("orig".to_owned())));
+    }
+
+    /// A legacy `summary` line (session title) produces no row at all.
+    #[rstest]
+    fn repro_summary_line_sets_the_session_title() {
+        let m = ccode(&serde_json::json!({
+            "type": "summary", "summary": "Fix the flaky sync test", "leafUuid": "u9",
+        }));
+        let row = MessageEnricher::new(HarnessKind::ClaudeCode).capture(&session(), &m);
+        assert_eq!(row.and_then(|r| r.session_title).as_deref(), Some("Fix the flaky sync test"));
+    }
+
+    fn session() -> SessionId {
+        SessionId::from("s1".to_owned())
+    }
+}
