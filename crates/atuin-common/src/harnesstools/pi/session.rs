@@ -1,7 +1,25 @@
+//! Pi coding agent sessions: one JSONL file per session, a `session` header line followed by
+//! tree-linked entries (pi-mono `packages/coding-agent/src/core/session-manager.ts`).
+//!
+//! Three pi behaviours shape this reader:
+//!
+//! - **Forks copy entries verbatim.** `/fork` (`forkFrom`) and `/tree` into a new session
+//!   (`createBranchedSession`) copy every prior entry, ids, timestamps and usage included, into a
+//!   new file whose header names the parent *file path* (`parentSession`). So a model call's
+//!   [`turn_id`](Message::turn_id) is derived only from what the copy keeps, and the parent path
+//!   is resolved to the parent's session id.
+//! - **The session id is the header's `id`.** Pi names files `<timestamp>_<id>.jsonl`, but
+//!   `pi --session <path>` keeps any explicit name, so the header is authoritative and the file
+//!   name only a fallback.
+//! - **Old files are migrated in place.** Opening a v1 file rewrites it with random entry ids
+//!   (`migrateV1ToV2`). Those ids are ignored (see [`PiMessage`]) so a line keeps the identity it
+//!   had before the rewrite.
+
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use futures::{Stream, TryStreamExt};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::sync::watch;
@@ -19,6 +37,10 @@ use crate::harnesstools::session::{
 use crate::json::jsonl;
 use crate::sync::BlockingPool;
 use crate::utils::{env_nonempty, home_dir};
+
+/// How far into a file the header line is looked for, like pi's own bounded header scan
+/// (session-manager.ts `MAX_SESSION_HEADER_SCAN_BYTES`).
+const MAX_HEADER_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, TypedBuilder)]
 pub struct PiSessions {
@@ -103,12 +125,18 @@ pub struct PiListener {
 
 impl PiListener {
     /// Build a read-once session for an accepted `jsonl` file (no change signal), or `None`.
+    ///
+    /// Reads the file's first line for the session id. `None` too while that line is still
+    /// being written: the watcher offers the file again once its content changes.
     fn open_session(path: &Path, is_file: bool, pool: &BlockingPool) -> Option<PiSession> {
         if !is_file || path.extension().is_none_or(|ext| ext != "jsonl") {
             return None;
         }
-        let stem = path.file_stem()?.to_string_lossy();
-        let id = stem.split_once('_').map_or(stem.as_ref(), |(_, id)| id).to_owned();
+        let id = match read_header(path) {
+            Ok(Header::Session { id }) => id,
+            Ok(Header::Other) => file_name_id(path)?,
+            Ok(Header::Pending) | Err(_) => return None,
+        };
         Some(PiSession::open(SessionId::from(id), path.to_path_buf(), pool.clone()))
     }
 
@@ -148,6 +176,65 @@ impl Listener for PiListener {
     }
 }
 
+/// What the first line of a would-be session file says.
+#[derive(Debug, PartialEq, Eq)]
+enum Header {
+    /// A pi `session` header.
+    Session {
+        id: String,
+    },
+    /// A complete first line that is not a session header.
+    Other,
+    /// Nothing complete yet: an empty file, or a first line still being written.
+    Pending,
+}
+
+/// Read the header of the session file at `path`: its first non-blank line, bounded by
+/// [`MAX_HEADER_BYTES`]. A final line without a newline counts once it parses, as in pi's
+/// `readSessionHeader`.
+fn read_header(path: &Path) -> std::io::Result<Header> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = BufReader::new(file.take(MAX_HEADER_BYTES));
+    let mut line = Vec::new();
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            return Ok(Header::Pending);
+        }
+        let terminated = line.last() == Some(&b'\n');
+        if line.trim_ascii().is_empty() {
+            if terminated {
+                continue;
+            }
+            return Ok(Header::Pending);
+        }
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(rename = "type")]
+            kind: Option<String>,
+            id: Option<serde_json::Value>,
+        }
+        return Ok(match serde_json::from_slice::<Raw>(&line) {
+            Ok(Raw {
+                kind: Some(kind),
+                id: Some(serde_json::Value::String(id)),
+            }) if kind == "session" => Header::Session { id },
+            Ok(_) => Header::Other,
+            // A half-written line: wait for the rest.
+            Err(_) if !terminated => Header::Pending,
+            Err(_) => Header::Other,
+        });
+    }
+}
+
+/// The session id pi's own file naming (`<timestamp>_<id>.jsonl`, session-manager.ts
+/// `newSession`) puts in `path`: everything after the first `_`, which the timestamp never
+/// contains. The whole stem for any other name.
+fn file_name_id(path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_string_lossy();
+    Some(stem.split_once('_').map_or(stem.as_ref(), |(_, id)| id).to_owned())
+}
+
 #[derive(Debug, Clone)]
 pub struct PiSession {
     id: SessionId,
@@ -170,6 +257,27 @@ impl PiSession {
     }
 }
 
+/// Resolve a header's `parentSession` file path to the parent's session id by reading the
+/// parent's own header, so a custom-named parent (`pi --session <path>`) resolves too. Other
+/// lines pass through untouched.
+async fn resolve_parent(
+    mut message: PiMessage,
+    dir: Option<PathBuf>,
+    pool: BlockingPool,
+) -> PiMessage {
+    let Some(parent) = message.parent_session_path() else {
+        return message;
+    };
+    let parent = match dir {
+        Some(dir) if Path::new(parent).is_relative() => dir.join(parent),
+        _ => PathBuf::from(parent),
+    };
+    if let Ok(Ok(Header::Session { id })) = pool.run(move || read_header(&parent)).await {
+        message.resolved_parent = Some(SessionId::from(id));
+    }
+    message
+}
+
 impl Session for PiSession {
     type Message = PiMessage;
 
@@ -178,40 +286,107 @@ impl Session for PiSession {
     }
 
     async fn message_at(&self, at: u64) -> Option<PiMessage> {
-        jsonl::value_at(&self.path, at, &self.pool).await
+        let message = jsonl::value_at(&self.path, at, &self.pool).await?;
+        Some(
+            resolve_parent(message, self.path.parent().map(Path::to_path_buf), self.pool.clone())
+                .await,
+        )
     }
 
     fn messages_from(
         self,
         from: u64,
     ) -> impl Stream<Item = Result<(u64, PiMessage), MessageError>> + Send + 'static {
+        let dir = self.path.parent().map(Path::to_path_buf);
+        let pool = self.pool.clone();
         jsonl::follow_from::<PiMessage>(self.path, from, self.changes, self.pool)
             .map_err(MessageError::from)
+            .and_then(move |(at, message)| {
+                let (dir, pool) = (dir.clone(), pool.clone());
+                async move { Ok((at, resolve_parent(message, dir, pool).await)) }
+            })
     }
 
     fn read(&self) -> impl Stream<Item = Result<PiMessage, MessageError>> + Send + 'static {
+        let dir = self.path.parent().map(Path::to_path_buf);
+        let pool = self.pool.clone();
         jsonl::read_all::<PiMessage>(self.path.clone(), self.pool.clone())
             .map_err(MessageError::from)
+            .and_then(move |message| {
+                let (dir, pool) = (dir.clone(), pool.clone());
+                async move { Ok(resolve_parent(message, dir, pool).await) }
+            })
+    }
+}
+
+/// One line of a pi session file.
+///
+/// A line pi's v1→v2 migration gave an id (`migrateV1ToV2`, which rewrites the file in place)
+/// is recognised by its key order: pi builds every entry as `type, id, parentId, timestamp, ..`
+/// (or with extension fields before `id`), while the migration appends `id` and `parentId` to a
+/// v1 entry that already had its `timestamp`. Such a line reports no [`id`](Message::id) or
+/// [`parent_id`](Message::parent_id): the random ids did not exist when the line may first have
+/// been captured, so it keeps the content-derived identity it had then.
+#[derive(Debug, Clone)]
+pub struct PiMessage {
+    entry: PiEntry,
+    /// `id` and `parentId` were assigned by pi's v1→v2 migration, not written with the entry.
+    migrated: bool,
+    /// On the header: the parent's session id, read from the parent file's own header.
+    resolved_parent: Option<SessionId>,
+}
+
+impl<'de> Deserialize<'de> for PiMessage {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // The workspace builds serde_json with `preserve_order`, so the map keeps the line's
+        // key order.
+        let fields = serde_json::Map::<String, serde_json::Value>::deserialize(deserializer)?;
+        let position = |key: &str| fields.keys().position(|k| k == key);
+        let migrated = matches!(
+            (position("timestamp"), position("id")),
+            (Some(timestamp), Some(id)) if timestamp < id
+        );
+        let entry = PiEntry::deserialize(serde_json::Value::Object(fields))
+            .map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            entry,
+            migrated,
+            resolved_parent: None,
+        })
     }
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct PiMessage {
+#[serde(rename_all = "camelCase")]
+struct PiEntry {
     #[serde(rename = "type")]
     kind: String,
     id: Option<String>,
-    #[serde(rename = "parentId")]
     parent_id: Option<String>,
     timestamp: Option<String>,
     message: Option<serde_json::Value>,
     cwd: Option<PathBuf>,
-    #[serde(rename = "modelId")]
+    /// On `model_change` (and the v1 header): the model switched to.
     model_id: Option<String>,
+    /// On `usage`: the model the usage is attributed to.
+    model: Option<String>,
     /// On `session_info`: a name the user gave the session.
     name: Option<String>,
-    /// On the `session` header: the session this one was forked from.
-    #[serde(rename = "parentSession")]
+    /// On the `session` header: the file of the session this one was forked from.
     parent_session: Option<String>,
+    /// On a v1 `session` header: what `parentSession` was called then.
+    branched_from: Option<String>,
+    /// On `compaction` / `branch_summary`: the model-written summary.
+    summary: Option<String>,
+    /// On `compaction` / `branch_summary` / `usage`: the LLM call(s) the entry records.
+    usage: Option<serde_json::Value>,
+    /// On `custom_message`: what an extension injected into the model's context.
+    content: Option<serde_json::Value>,
+}
+
+/// Entry types whose top-level `usage` records a model call of their own.
+fn has_own_usage(kind: &str) -> bool {
+    matches!(kind, "compaction" | "branch_summary" | "usage")
 }
 
 impl PiMessage {
@@ -227,84 +402,170 @@ impl PiMessage {
             _ => Content::Other(value.clone()),
         }
     }
-}
 
-impl Message for PiMessage {
-    fn id(&self) -> Option<MessageId> {
-        self.id.clone().map(MessageId::from)
-    }
-
-    fn role(&self) -> Role {
-        let role =
-            self.message.as_ref().and_then(|m| m["role"].as_str()).unwrap_or(self.kind.as_str());
-        match role {
-            "user" => Role::User,
-            "assistant" => Role::Assistant,
-            "system" => Role::System,
-            "toolResult" | "tool" => Role::Tool,
-            "bashExecution" => Role::User,
-            other => Role::Other(other.to_owned()),
-        }
-    }
-
-    fn timestamp(&self) -> Option<OffsetDateTime> {
-        self.timestamp.as_deref().and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
-    }
-
-    fn content(&self) -> Vec<Content> {
-        let Some(message) = self.message.as_ref() else {
-            return Vec::new();
-        };
-        if message["role"].as_str() == Some("toolResult") {
-            return vec![Content::ToolResult(ToolResult {
-                call: ToolCallId::from(
-                    message["toolCallId"].as_str().unwrap_or_default().to_owned(),
-                ),
-                output: message["content"].clone(),
-                error: message["isError"].as_bool().unwrap_or(false),
-            })];
-        }
-        // A `!command` the user ran in pi's own shell, with what it printed.
-        if message["role"].as_str() == Some("bashExecution") {
-            return vec![
-                Content::Text(format!("!{}", message["command"].as_str().unwrap_or_default())),
-                Content::ToolResult(ToolResult {
-                    call: ToolCallId::from(self.id.clone().unwrap_or_default()),
-                    output: message["output"].clone(),
-                    error: message["exitCode"].as_i64().is_some_and(|c| c != 0),
-                }),
-            ];
-        }
-        match &message["content"] {
+    /// A pi content value: a plain string or an array of blocks.
+    fn blocks(content: &serde_json::Value) -> Vec<Content> {
+        match content {
             serde_json::Value::String(text) => vec![Content::Text(text.clone())],
             serde_json::Value::Array(blocks) => blocks.iter().map(Self::block).collect(),
             _ => Vec::new(),
         }
     }
 
-    fn model(&self) -> Option<String> {
-        // Assistant turns name their model; a `model_change` line names the new one at the top.
-        self.message
-            .as_ref()
-            .and_then(|m| m.get("model")?.as_str().map(str::to_owned))
-            .or_else(|| self.model_id.clone())
+    /// `message.role`, on a `message` entry.
+    fn message_role(&self) -> Option<&str> {
+        self.entry.message.as_ref()?.get("role")?.as_str()
     }
 
-    fn usage(&self) -> Option<Usage> {
-        let usage = self.message.as_ref()?.get("usage")?;
-        if usage.is_null() {
+    fn message_str(&self, key: &str) -> Option<&str> {
+        self.entry.message.as_ref()?.get(key)?.as_str()
+    }
+
+    /// The raw usage object this line reports as session usage: an assistant message's, or the
+    /// top-level one of an entry that records its own model call. A tool result's `usage` is
+    /// "not part of main LLM context accounting" (pi-ai types.ts `ToolResultMessage`).
+    fn raw_usage(&self) -> Option<&serde_json::Value> {
+        let usage = if has_own_usage(&self.entry.kind) {
+            self.entry.usage.as_ref()
+        } else if self.message_role() == Some("assistant") {
+            self.entry.message.as_ref()?.get("usage")
+        } else {
+            None
+        };
+        usage.filter(|u| u.is_object())
+    }
+
+    /// The header's `parentSession` (v1: `branchedFrom`) file path.
+    fn parent_session_path(&self) -> Option<&str> {
+        if self.entry.kind != "session" {
             return None;
         }
+        self.entry
+            .parent_session
+            .as_deref()
+            .or(self.entry.branched_from.as_deref())
+            .filter(|p| !p.trim().is_empty())
+    }
+}
+
+impl Message for PiMessage {
+    fn id(&self) -> Option<MessageId> {
+        (!self.migrated).then(|| self.entry.id.clone().map(MessageId::from)).flatten()
+    }
+
+    fn role(&self) -> Role {
+        let role = match self.entry.kind.as_str() {
+            "message" => self.message_role().unwrap_or("message"),
+            // Summaries pi feeds back to the model as context (session-manager.ts
+            // `sessionEntryToContextMessages`); neither the user nor the model said them.
+            "compaction" | "branch_summary" => return Role::System,
+            "custom_message" => "custom",
+            other => other,
+        };
+        match role {
+            "user" => Role::User,
+            "assistant" => Role::Assistant,
+            "system" | "branchSummary" | "compactionSummary" => Role::System,
+            "toolResult" | "tool" => Role::Tool,
+            "bashExecution" => Role::User,
+            // Extension-injected context (`custom_message` entries, `role: "custom"` messages,
+            // v2's `hookMessage` before pi's v3 migration renamed it). Pi sends it to the model
+            // as a user message (messages.ts `convertToLlm`), but the user did not write it;
+            // `display` only picks how pi's TUI renders it.
+            "custom" | "hookMessage" => Role::Other("custom".to_owned()),
+            other => Role::Other(other.to_owned()),
+        }
+    }
+
+    fn timestamp(&self) -> Option<OffsetDateTime> {
+        self.entry.timestamp.as_deref().and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
+    }
+
+    fn content(&self) -> Vec<Content> {
+        match self.entry.kind.as_str() {
+            "compaction" | "branch_summary" => {
+                return self
+                    .entry
+                    .summary
+                    .iter()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| Content::Summary(s.clone()))
+                    .collect();
+            }
+            "custom_message" => {
+                return self.entry.content.as_ref().map(Self::blocks).unwrap_or_default();
+            }
+            "message" => {}
+            _ => return Vec::new(),
+        }
+        let Some(message) = self.entry.message.as_ref() else {
+            return Vec::new();
+        };
+        match self.message_role() {
+            Some("toolResult") => vec![Content::ToolResult(ToolResult {
+                call: ToolCallId::from(
+                    message["toolCallId"].as_str().unwrap_or_default().to_owned(),
+                ),
+                output: message["content"].clone(),
+                error: message["isError"].as_bool().unwrap_or(false),
+            })],
+            // A `!command` the user ran in pi's own shell, with what it printed.
+            // It has no tool call of its own, so the entry names it (a v1 entry by its time).
+            Some("bashExecution") => vec![
+                Content::Text(format!("!{}", message["command"].as_str().unwrap_or_default())),
+                Content::ToolResult(ToolResult {
+                    call: ToolCallId::from(self.id().map_or_else(
+                        || format!("bash:{}", self.entry.timestamp.as_deref().unwrap_or_default()),
+                        String::from,
+                    )),
+                    output: message["output"].clone(),
+                    error: message["exitCode"].as_i64().is_some_and(|c| c != 0),
+                }),
+            ],
+            Some("branchSummary" | "compactionSummary") => message["summary"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(|s| vec![Content::Summary(s.to_owned())])
+                .unwrap_or_default(),
+            role => {
+                let mut content = Self::blocks(&message["content"]);
+                // A failed or aborted call usually has no content; `errorMessage` is what pi
+                // shows for it (pi-ai types.ts `AssistantMessage.errorMessage`).
+                if role == Some("assistant")
+                    && let Some(error) = self.message_str("errorMessage").filter(|e| !e.is_empty())
+                {
+                    content.push(Content::Error(error.to_owned()));
+                }
+                content
+            }
+        }
+    }
+
+    fn model(&self) -> Option<String> {
+        // Assistant turns name their model (the one the provider reports first); a
+        // `model_change` line or v1 header names it at the top, a `usage` entry as `model`.
+        self.message_str("responseModel")
+            .or_else(|| self.message_str("model"))
+            .or(self.entry.model_id.as_deref())
+            .or(self.entry.model.as_deref())
+            .map(str::to_owned)
+    }
+
+    /// `input` is the uncached prompt: pi-ai reports `cacheRead` separately (its context size is
+    /// `input + cacheRead`, pi-ai utils/overflow.ts).
+    fn usage(&self) -> Option<Usage> {
+        let usage = self.raw_usage()?;
+        let count = |key: &str| usage.get(key).and_then(serde_json::Value::as_u64);
         Some(Usage {
-            input: usage.get("input").and_then(serde_json::Value::as_u64),
-            output: usage.get("output").and_then(serde_json::Value::as_u64),
-            cache_read: usage.get("cacheRead").and_then(serde_json::Value::as_u64),
-            cache_write: usage.get("cacheWrite").and_then(serde_json::Value::as_u64),
+            input: count("input"),
+            output: count("output"),
+            cache_read: count("cacheRead"),
+            cache_write: count("cacheWrite"),
         })
     }
 
     fn stop_reason(&self) -> Option<StopReason> {
-        let raw = self.message.as_ref()?.get("stopReason")?.as_str()?;
+        let raw = self.message_str("stopReason")?;
         Some(match raw {
             "stop" => StopReason::EndTurn,
             "toolUse" => StopReason::ToolUse,
@@ -316,27 +577,63 @@ impl Message for PiMessage {
     }
 
     fn parent_id(&self) -> Option<MessageId> {
-        self.parent_id.clone().map(MessageId::from)
+        (!self.migrated).then(|| self.entry.parent_id.clone().map(MessageId::from)).flatten()
     }
 
     /// Only the `session` header carries the directory; it is the first line, so the session row
     /// gets it before any turn.
     fn cwd(&self) -> Option<PathBuf> {
-        self.cwd.clone()
+        self.entry.cwd.clone()
     }
 
-    /// Only the `session` header names a parent; it is the first line, so the enricher sees it
-    /// before any turn.
+    /// Only the `session` header names a parent, as the parent's file path; this is the id that
+    /// file's header carries when the session could read it, else the id its file name carries.
     fn parent_session(&self) -> Option<SessionId> {
-        self.parent_session.clone().map(SessionId::from)
+        let path = self.parent_session_path()?;
+        self.resolved_parent.clone().or_else(|| file_name_id(Path::new(path)).map(SessionId::from))
     }
 
+    /// A `session_info` name, trimmed as pi reads it (session-manager.ts `getSessionName`). A
+    /// blank name clears pi's title, which a line cannot express here: it assigns none.
     fn title(&self) -> Option<String> {
-        (self.kind == "session_info").then(|| self.name.clone()).flatten()
+        if self.entry.kind != "session_info" {
+            return None;
+        }
+        let name = self.entry.name.as_deref()?.trim();
+        (!name.is_empty()).then(|| name.to_owned())
     }
 
+    /// One model call, identified by what a fork's verbatim copy keeps: the provider's
+    /// `responseId` when there is one, else the entry's id and timestamp, else (a v1 line, with
+    /// no id or a migration-assigned one) its timestamps and token counts.
     fn turn_id(&self) -> Option<String> {
-        self.message.as_ref()?.get("responseId")?.as_str().map(str::to_owned)
+        if !has_own_usage(&self.entry.kind) && self.message_role() != Some("assistant") {
+            return None;
+        }
+        if let Some(response) = self.message_str("responseId").filter(|r| !r.is_empty()) {
+            return Some(response.to_owned());
+        }
+        let timestamp = self.entry.timestamp.as_deref().unwrap_or_default();
+        if let Some(id) = self.id() {
+            return Some(format!("entry:{id}:{timestamp}"));
+        }
+        let sent = self
+            .entry
+            .message
+            .as_ref()
+            .and_then(|m| m.get("timestamp"))
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        let tokens = self.usage().unwrap_or_default();
+        let count = |n: Option<u64>| n.map(|n| n.to_string()).unwrap_or_default();
+        Some(format!(
+            "line:{}:{timestamp}:{sent}:{}:{}:{}:{}",
+            self.entry.kind,
+            count(tokens.input),
+            count(tokens.output),
+            count(tokens.cache_read),
+            count(tokens.cache_write),
+        ))
     }
 }
 
@@ -520,10 +817,31 @@ mod tests {
         assert_eq!(m.turn_id().as_deref(), Some("r1"));
     }
 
+    /// pi writes `parentSession` as the parent's *file path* (session-manager.ts
+    /// `createBranchedSession`, `forkFrom`); a v1 header called it `branchedFrom`. Without the
+    /// parent's header to hand, the id comes from pi's `<timestamp>_<id>.jsonl` file name.
     #[rstest]
-    #[case(serde_json::json!({"type": "session", "id": "s2", "cwd": "/w", "parentSession": "s1"}), Some("s1"))]
-    #[case(serde_json::json!({"type": "session", "id": "s2", "cwd": "/w"}), None)]
-    #[case(serde_json::json!({"type": "message", "id": "m1", "message": {"role": "user", "content": "hi"}}), None)]
+    #[case::fork(
+        serde_json::json!({"type": "session", "version": 3, "id": "s2", "cwd": "/w",
+            "parentSession": "/home/u/.pi/agent/sessions/--w--/2026-09-18T10-00-00-000Z_0199aaaa-bbbb.jsonl"}),
+        Some("0199aaaa-bbbb")
+    )]
+    #[case::bare_file_name(
+        serde_json::json!({"type": "session", "id": "s2", "cwd": "/w",
+            "parentSession": "2026-09-18T10-00-00-000Z_0199aaaa-bbbb.jsonl"}),
+        Some("0199aaaa-bbbb")
+    )]
+    #[case::v1_branched_from(
+        serde_json::json!({"type": "session", "id": "s2", "cwd": "/w",
+            "branchedFrom": "/s/--w--/2025-12-09T00-52-54-397Z_d97339c6-6c10.jsonl"}),
+        Some("d97339c6-6c10")
+    )]
+    #[case::root(serde_json::json!({"type": "session", "id": "s2", "cwd": "/w"}), None)]
+    #[case::not_a_header(
+        serde_json::json!({"type": "message", "id": "m1", "parentSession": "/x/1_p.jsonl",
+            "message": {"role": "user", "content": "hi"}}),
+        None
+    )]
     fn the_header_names_the_parent_session(
         #[case] raw: serde_json::Value,
         #[case] parent: Option<&str>,
@@ -757,8 +1075,6 @@ mod tests {
         assert!(tool_results >= 1, "expected at least one normalized toolResult");
     }
 
-    // ---- Audit repros (expected to FAIL until the parser is fixed) ----
-
     fn pi(raw: &serde_json::Value) -> PiMessage {
         serde_json::from_str(&raw.to_string()).unwrap()
     }
@@ -773,13 +1089,21 @@ mod tests {
             .collect()
     }
 
+    fn tokens(input: u64, output: u64) -> Usage {
+        Usage {
+            input: Some(input),
+            output: Some(output),
+            cache_read: Some(0),
+            cache_write: Some(0),
+        }
+    }
+
     /// pi writes `parentSession` as the parent's *file path* (session-manager.ts:1674
-    /// `createBranchedSession`, :1851 `forkFrom`), never its id. The parser passes it through
-    /// verbatim, so the fork's parent is a path no session row is keyed by.
+    /// `createBranchedSession`, :1851 `forkFrom`), never its id.
     #[rstest]
     #[case("/home/u/.pi/agent/sessions/--w--/2026-09-18T10-00-00-000Z_0199aaaa-bbbb.jsonl")]
     #[case("2026-09-18T10-00-00-000Z_0199aaaa-bbbb.jsonl")]
-    fn repro_header_parent_session_path_resolves_to_the_parent_id(#[case] parent: &str) {
+    fn header_parent_session_path_resolves_to_the_parent_id(#[case] parent: &str) {
         let m = pi(&serde_json::json!({
             "type": "session", "version": 3, "id": "0199cccc", "timestamp": "2026-09-18T10:00:00Z",
             "cwd": "/w", "parentSession": parent,
@@ -787,79 +1111,104 @@ mod tests {
         assert_eq!(m.parent_session(), Some(SessionId::from("0199aaaa-bbbb".to_owned())));
     }
 
-    /// A failed assistant turn (`stopReason: "error"`) typically has empty content; the only
-    /// user-visible text is `errorMessage` (pi-ai types.ts AssistantMessage.errorMessage, shown
-    /// by the TUI assistant-message.ts:190). The parser drops it.
+    /// A failed assistant turn typically has empty content; the only user-visible text is
+    /// `errorMessage` (pi-ai types.ts `AssistantMessage.errorMessage`, shown by the TUI's
+    /// assistant-message.ts).
     #[rstest]
-    #[case("error", "529 overloaded_error")]
-    #[case("aborted", "Request was aborted")]
-    fn repro_assistant_error_message_is_kept(#[case] stop: &str, #[case] error: &str) {
+    #[case("error", StopReason::Error, "529 overloaded_error")]
+    #[case("aborted", StopReason::Aborted, "Request was aborted")]
+    fn a_failed_assistant_turn_keeps_its_error_message(
+        #[case] stop: &str,
+        #[case] reason: StopReason,
+        #[case] error: &str,
+    ) {
         let m = pi(&serde_json::json!({
             "type": "message", "id": "a1", "parentId": "u1", "timestamp": "2026-09-18T10:00:00Z",
             "message": {"role": "assistant", "content": [], "stopReason": stop, "errorMessage": error,
                 "model": "m", "usage": {"input": 1, "output": 0, "cacheRead": 0, "cacheWrite": 0}},
         }));
-        assert!(
-            texts(&m).iter().any(|t| t.contains(error)),
-            "errorMessage lost: {:?}",
-            m.content()
-        );
+        assert_eq!(m.content(), vec![Content::Error(error.to_owned())]);
+        assert_eq!(m.stop_reason(), Some(reason));
     }
 
-    /// `compaction` / `branch_summary` carry a top-level `summary` (session-manager.ts:91,106) that
-    /// pi feeds back into context (session-manager.ts:458-463); the parser only reads `message`.
+    #[rstest]
+    fn a_successful_assistant_turn_has_no_error() {
+        let m = pi(&serde_json::json!({"type": "message", "id": "a1",
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "ok"}],
+                "stopReason": "stop", "errorMessage": ""}}));
+        assert_eq!(m.content(), vec![Content::Text("ok".to_owned())]);
+    }
+
+    /// `compaction` / `branch_summary` carry a top-level `summary` (session-manager.ts
+    /// `CompactionEntry`, `BranchSummaryEntry`) that pi feeds back into context
+    /// (`sessionEntryToContextMessages`).
     #[rstest]
     #[case(serde_json::json!({"type": "compaction", "id": "c1", "parentId": "a1",
         "timestamp": "2026-09-18T10:00:00Z", "summary": "SUMMARY-TEXT", "firstKeptEntryId": "u1",
         "tokensBefore": 1000}))]
     #[case(serde_json::json!({"type": "branch_summary", "id": "b1", "parentId": "a1",
         "timestamp": "2026-09-18T10:00:00Z", "summary": "SUMMARY-TEXT", "fromId": "a9"}))]
-    fn repro_summary_entries_keep_their_summary(#[case] raw: serde_json::Value) {
+    fn summary_entries_keep_their_summary(#[case] raw: serde_json::Value) {
         let m = pi(&raw);
-        assert!(
-            texts(&m).iter().any(|t| t.contains("SUMMARY-TEXT")),
-            "summary lost: {:?}",
-            m.content()
-        );
+        assert_eq!(m.content(), vec![Content::Summary("SUMMARY-TEXT".to_owned())]);
+        assert_eq!(m.role(), Role::System);
     }
 
-    /// `compaction` / `branch_summary` record the usage of the LLM call that wrote the summary as
-    /// a top-level `usage` (session-manager.ts:99,113); it is never reported.
+    /// `compaction` / `branch_summary` record the usage of the LLM call that wrote the summary,
+    /// and a `usage` entry that of a call outside the context (cache warming), all as a top-level
+    /// `usage` (session-manager.ts `CompactionEntry`, `BranchSummaryEntry`, `UsageEntry`). Each
+    /// is its own model call, named by the entry.
     #[rstest]
-    #[case("compaction")]
-    #[case("branch_summary")]
-    fn repro_summary_entries_report_their_usage(#[case] kind: &str) {
-        let m = pi(&serde_json::json!({
-            "type": kind, "id": "c1", "parentId": "a1", "timestamp": "2026-09-18T10:00:00Z",
-            "summary": "s", "firstKeptEntryId": "u1", "fromId": "a9", "tokensBefore": 1000,
-            "usage": {"input": 900, "output": 100, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 1000},
-        }));
-        assert_eq!(
-            m.usage(),
-            Some(Usage {
-                input: Some(900),
-                output: Some(100),
-                cache_read: Some(0),
-                cache_write: Some(0)
-            })
+    #[case::compaction(serde_json::json!({"type": "compaction", "summary": "s",
+        "firstKeptEntryId": "u1", "tokensBefore": 1000}), None)]
+    #[case::branch_summary(serde_json::json!({"type": "branch_summary", "summary": "s",
+        "fromId": "a9"}), None)]
+    #[case::cache_warm(serde_json::json!({"type": "usage", "kind": "cache_warm",
+        "provider": "anthropic", "model": "claude-opus-4-8"}), Some("claude-opus-4-8"))]
+    fn entries_with_their_own_usage_report_it(
+        #[case] mut raw: serde_json::Value,
+        #[case] model: Option<&str>,
+    ) {
+        raw.as_object_mut().unwrap().extend(
+            serde_json::json!({"id": "c1", "parentId": "a1", "timestamp": "2026-09-18T10:00:00Z",
+                "usage": {"input": 900, "output": 100, "cacheRead": 0, "cacheWrite": 0,
+                    "totalTokens": 1000}})
+            .as_object()
+            .unwrap()
+            .clone(),
         );
+        let m = pi(&raw);
+        assert_eq!(m.usage(), Some(tokens(900, 100)));
+        assert_eq!(m.turn_id().as_deref(), Some("entry:c1:2026-09-18T10:00:00Z"));
+        assert_eq!(m.model().as_deref(), model);
     }
 
-    /// `custom_message` keeps its content at the top level (session-manager.ts:159), not under
-    /// `message`, and pi injects it into context as a message (session-manager.ts:453).
+    /// `custom_message` keeps its content at the top level (session-manager.ts
+    /// `CustomMessageEntry`); `role: "custom"` messages (v2: `hookMessage`) under `message`.
+    /// Either way an extension wrote it, not the user, whatever pi's TUI does with `display`.
     #[rstest]
-    fn repro_custom_message_entry_keeps_its_content() {
-        let m = pi(&serde_json::json!({
-            "type": "custom_message", "id": "x1", "parentId": "a1", "timestamp": "2026-09-18T10:00:00Z",
-            "customType": "ext", "content": "INJECTED", "display": true,
-        }));
+    #[case::entry_shown(serde_json::json!({"type": "custom_message", "id": "x1", "parentId": "a1",
+        "timestamp": "2026-09-18T10:00:00Z", "customType": "ext", "content": "INJECTED", "display": true}))]
+    #[case::entry_hidden(serde_json::json!({"type": "custom_message", "customType": "ext",
+        "content": [{"type": "text", "text": "INJECTED"}], "display": false, "id": "x1",
+        "parentId": "a1", "timestamp": "2026-09-18T10:00:00Z"}))]
+    #[case::message(serde_json::json!({"type": "message", "id": "x1", "timestamp": "2026-09-18T10:00:00Z",
+        "message": {"role": "custom", "customType": "ext", "content": "INJECTED", "display": true}}))]
+    #[case::v2_hook_message(serde_json::json!({"type": "message", "id": "x1",
+        "timestamp": "2026-09-18T10:00:00Z",
+        "message": {"role": "hookMessage", "customType": "ext", "content": "INJECTED", "display": true}}))]
+    fn custom_messages_keep_their_content(#[case] raw: serde_json::Value) {
+        let m = pi(&raw);
         assert_eq!(texts(&m), vec!["INJECTED".to_owned()]);
+        assert_eq!(m.role(), Role::Other("custom".to_owned()));
+        assert_eq!(m.id(), Some(MessageId::from("x1".to_owned())));
+        assert_eq!(m.usage(), None);
     }
 
-    /// A tool result's `usage` is "not part of main LLM context accounting" (pi-ai types.ts:571);
-    /// tokscale counts assistant usage only (tokscale sessions/pi.rs:523). The parser reports it.
+    /// A tool result's `usage` is "not part of main LLM context accounting" (pi-ai types.ts
+    /// `ToolResultMessage`); tokscale counts assistant usage only (tokscale sessions/pi.rs).
     #[rstest]
-    fn repro_tool_result_usage_is_not_session_usage() {
+    fn tool_result_usage_is_not_session_usage() {
         let m = pi(&serde_json::json!({
             "type": "message", "id": "t1", "parentId": "a1", "timestamp": "2026-09-18T10:00:00Z",
             "message": {"role": "toolResult", "toolCallId": "c1", "toolName": "subagent",
@@ -867,24 +1216,26 @@ mod tests {
                 "usage": {"input": 5000, "output": 500, "cacheRead": 0, "cacheWrite": 0}},
         }));
         assert_eq!(m.usage(), None);
+        assert_eq!(m.turn_id(), None);
     }
 
-    /// An empty `session_info` name clears the title (session-manager.ts:1318-1323
-    /// `getSessionName`); the parser reports `Some("")`.
+    /// pi trims a `session_info` name, and a blank one clears the title (session-manager.ts
+    /// `getSessionName`). Clearing is not expressible per line, so a blank name assigns none.
     #[rstest]
-    #[case("")]
-    #[case("   ")]
-    fn repro_empty_session_info_name_is_no_title(#[case] name: &str) {
+    #[case("", None)]
+    #[case("   ", None)]
+    #[case("  my session ", Some("my session"))]
+    fn session_info_names_are_trimmed_titles(#[case] name: &str, #[case] title: Option<&str>) {
         let m = pi(&serde_json::json!({"type": "session_info", "id": "i1", "parentId": "a1",
             "timestamp": "2026-09-18T10:00:00Z", "name": name}));
-        assert_eq!(m.title(), None);
+        assert_eq!(m.title().as_deref(), title);
     }
 
     /// `pi --session <path>` keeps any explicit file name (session-manager.ts `_setSessionFile`,
     /// "preserve explicit path"), so the file stem is not the session id; the header's `id` is.
     #[rstest]
     #[tokio::test]
-    async fn repro_session_id_comes_from_the_header_not_the_file_name() {
+    async fn session_id_comes_from_the_header_not_the_file_name() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("my_notes.jsonl"),
@@ -898,5 +1249,150 @@ mod tests {
         let ids: Vec<String> =
             sessions.existing().unwrap().map(|s| s.unwrap().id().into()).collect().await;
         assert_eq!(ids, vec!["0199dddd".to_owned()]);
+    }
+
+    /// Pi creates a session file before (or while) writing its header; until the header line is
+    /// there the file is no session yet, and the watcher offers it again once it grows.
+    #[rstest]
+    #[tokio::test]
+    async fn existing_skips_a_file_whose_header_is_not_written_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("2026-09-18T10-00-00-000Z_s1.jsonl"), b"").unwrap();
+        std::fs::write(dir.path().join("2026-09-18T10-00-00-000Z_s2.jsonl"), br#"{"type":"sess"#)
+            .unwrap();
+        let sessions = PiSessions::builder().root(dir.path().to_path_buf()).pool(pool()).build();
+        let found: Vec<_> = sessions.existing().unwrap().collect().await;
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    #[rstest]
+    #[case::empty(b"".as_slice(), Header::Pending)]
+    #[case::half_written(br#"{"type":"session","id":"#.as_slice(), Header::Pending)]
+    #[case::unterminated_but_whole(
+        br#"{"type":"session","id":"s1"}"#.as_slice(),
+        Header::Session { id: "s1".to_owned() }
+    )]
+    #[case::after_blank_lines(
+        b"\n  \n{\"type\":\"session\",\"id\":\"s1\"}\n{}\n".as_slice(),
+        Header::Session { id: "s1".to_owned() }
+    )]
+    #[case::not_a_header(b"{\"type\":\"message\",\"id\":\"m1\"}\n".as_slice(), Header::Other)]
+    #[case::id_not_a_string(b"{\"type\":\"session\",\"id\":1}\n".as_slice(), Header::Other)]
+    #[case::garbage(b"nope\n".as_slice(), Header::Other)]
+    fn reads_the_header_line(#[case] body: &[u8], #[case] expected: Header) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.jsonl");
+        std::fs::write(&path, body).unwrap();
+        assert_eq!(read_header(&path).unwrap(), expected);
+    }
+
+    /// The session reading a fork resolves its parent through the parent file's own header, so a
+    /// parent kept under an explicit name (`pi --session <path>`) resolves to its id too, the
+    /// same id [`Session::id`] gives the parent.
+    #[rstest]
+    #[tokio::test]
+    async fn a_fork_resolves_its_parent_through_the_parents_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("my_notes.jsonl");
+        std::fs::write(
+            &parent,
+            serde_json::json!({"type": "session", "version": 3, "id": "0199aaaa", "cwd": "/w"})
+                .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let fork = dir.path().join("2026-09-18T11-00-00-000Z_0199bbbb.jsonl");
+        std::fs::write(
+            &fork,
+            serde_json::json!({"type": "session", "version": 3, "id": "0199bbbb", "cwd": "/w",
+                "parentSession": parent})
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let sessions = PiSessions::builder().root(dir.path().to_path_buf()).pool(pool()).build();
+        let mut found: Vec<PiSession> = sessions.existing().unwrap().try_collect().await.unwrap();
+        found.sort_by_key(|s| String::from(s.id()));
+        let ids: Vec<String> = found.iter().map(|s| s.id().into()).collect();
+        assert_eq!(ids, vec!["0199aaaa".to_owned(), "0199bbbb".to_owned()]);
+
+        let fork = found.pop().unwrap();
+        let expected = Some(SessionId::from("0199aaaa".to_owned()));
+        let read: Vec<PiMessage> = fork.read().try_collect().await.unwrap();
+        assert_eq!(read[0].parent_session(), expected);
+        let at = fork.message_at(u64::try_from(fork_len(&fork)).unwrap()).await.unwrap();
+        assert_eq!(at.parent_session(), expected);
+        let followed: Vec<PiMessage> = fork.messages().try_collect().await.unwrap();
+        assert_eq!(followed[0].parent_session(), expected);
+    }
+
+    fn fork_len(session: &PiSession) -> usize {
+        std::fs::read(&session.path).unwrap().len()
+    }
+
+    /// `/fork` and `/tree` copy entries verbatim, ids and timestamps included (session-manager.ts
+    /// `forkFrom`, `createBranchedSession`), so a call is named by what the copy keeps: the
+    /// provider's `responseId`, else the entry id with its timestamp (8 random hex digits alone
+    /// are not unique across sessions).
+    #[rstest]
+    #[case::response_id(serde_json::json!({"responseId": "resp_1"}), "resp_1")]
+    #[case::blank_response_id(serde_json::json!({"responseId": ""}), "entry:a1b2c3d4:2026-09-18T10:00:05Z")]
+    #[case::no_response_id(serde_json::json!({}), "entry:a1b2c3d4:2026-09-18T10:00:05Z")]
+    fn an_assistant_turn_is_named_by_what_a_fork_copies(
+        #[case] extra: serde_json::Value,
+        #[case] turn: &str,
+    ) {
+        let mut message = serde_json::json!({"role": "assistant", "content": [],
+            "usage": {"input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0}});
+        message.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        let original =
+            pi(&serde_json::json!({"type": "message", "id": "a1b2c3d4", "parentId": "u1",
+            "timestamp": "2026-09-18T10:00:05Z", "message": message}));
+        // `createBranchedSession` re-parents the copy; nothing else changes.
+        let copy = pi(&serde_json::json!({"type": "message", "id": "a1b2c3d4", "parentId": null,
+            "timestamp": "2026-09-18T10:00:05Z", "message": message}));
+        assert_eq!(original.turn_id().as_deref(), Some(turn));
+        assert_eq!(copy.turn_id(), original.turn_id());
+    }
+
+    /// Mimic pi's `migrateV1ToV2` on one line: `id` and `parentId` appended to the entry (a JS
+    /// property assignment), `firstKeptEntryIndex` swapped for `firstKeptEntryId`.
+    fn migrate_v1(line: &str, id: &str, parent: Option<&str>) -> String {
+        let mut entry: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(line).unwrap();
+        entry.insert("id".to_owned(), id.into());
+        entry.insert("parentId".to_owned(), parent.into());
+        if entry.shift_remove("firstKeptEntryIndex").is_some() {
+            entry.insert("firstKeptEntryId".to_owned(), "0badf00d".into());
+        }
+        serde_json::Value::Object(entry).to_string()
+    }
+
+    /// pi migrates a v1 file in place when it opens it (session-manager.ts `_loadEntries` ->
+    /// `_rewriteFile`), giving every entry a random id. Each line reads the same before and
+    /// after, so a re-read after the rewrite resolves to the rows captured before it.
+    #[rstest]
+    fn a_v1_session_reads_the_same_after_pi_migrates_it() {
+        let lines: Vec<&str> =
+            include_str!("../../../tests/fixtures/pi/session-v1.jsonl").lines().skip(1).collect();
+        let mut parent: Option<String> = None;
+        for (n, line) in lines.iter().enumerate() {
+            let id = format!("{n:08x}");
+            let before = pi(&serde_json::from_str(line).unwrap());
+            let after =
+                pi(&serde_json::from_str(&migrate_v1(line, &id, parent.as_deref())).unwrap());
+            parent = Some(id);
+            assert_eq!(after.id(), None, "line {n}");
+            assert_eq!(after.parent_id(), None, "line {n}");
+            assert_eq!(after.role(), before.role(), "line {n}");
+            assert_eq!(after.content(), before.content(), "line {n}");
+            assert_eq!(after.usage(), before.usage(), "line {n}");
+            assert_eq!(after.turn_id(), before.turn_id(), "line {n}");
+            assert_eq!(after.timestamp(), before.timestamp(), "line {n}");
+            if before.usage().is_some() {
+                assert!(before.turn_id().is_some(), "line {n} has usage but no turn");
+            }
+        }
     }
 }
