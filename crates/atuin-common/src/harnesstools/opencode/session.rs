@@ -49,6 +49,31 @@
 //!   offered again under the same id with the aggregate's next row, resuming at the row it had
 //!   reached. A handle let go of mid-row is no different: the reader only moves on to the next
 //!   row once the message of this one is in the consumer's hands.
+//!
+//! # What is captured
+//!
+//! - **Parts**, each under its own id, with what they need of their message: its role, and for an
+//!   assistant's its model, cwd, the user message it answers and the model call it belongs to.
+//!   Text opencode injected into a message (`synthetic`) or kept from the model (`ignored`) is
+//!   the system's, and a compaction's summary is a [`Content::Summary`].
+//! - **Usage**, once per model call, from the call's `step-finish` part (see
+//!   [`OpencodeMessage::usage`](Message::usage)). A fork copies every message and part under
+//!   fresh ids; the copy names the same turn as its original, so its usage is not counted twice
+//!   (see `MessageInfo::turn_of`).
+//! - **Failures**: an assistant message whose info reports `error` is a row of its own, under the
+//!   message's id.
+//! - **The session**: its title, when first seen and each time it changes, its directory and the
+//!   session it was spawned from, from its `session.created.1` / `session.updated.1` rows.
+//!
+//! A revert's removals (`message.removed.1`, `message.part.removed.1`) are not read: what was
+//! captured stands. The reverted turns happened and cost their tokens, captured rows cannot be
+//! retracted downstream, and opencode writes one removal per message and part when the next
+//! prompt commits the revert, not when it is made.
+//!
+//! The experimental event system's `session.next.*` rows are delivered whole, as
+//! [`Content::Other`]: their schema (`packages/schema/src/session-event.ts`) is still moving --
+//! `session.next.step.ended` is at its second version already -- and this module does not model
+//! it yet.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
@@ -74,7 +99,7 @@ use crate::db::sqlite::observe::{
 use crate::db::{query_as, query_scalar};
 use crate::harnesstools::opencode::Opencode;
 use crate::harnesstools::session::model::{
-    Content, MessageId, Role, ToolCallId, ToolResult, ToolUse,
+    Content, MessageId, Role, StopReason, ToolCallId, ToolResult, ToolUse, Usage,
 };
 use crate::harnesstools::session::{
     Listener, Message, MessageError, Observable, RuntimeError, Session, SessionId, Sessions,
@@ -394,8 +419,11 @@ struct Reader {
     aggregate: Aggregate,
     reads: Arc<Reads>,
     anchor: Option<Anchor>,
-    /// The roles of the messages this session has lately read a `message.updated.1` row for.
-    roles: Roles,
+    /// What this session has lately learned of its messages from their `message.updated.1` rows.
+    infos: Infos,
+    /// The title this session last delivered, so that the `session.updated.1` rows opencode
+    /// writes on every prompt deliver a title only when it changes.
+    title: Option<String>,
     /// Whether the aggregate may have a row to read right now: set by a wake, kept while pages
     /// come back full.
     ready: bool,
@@ -411,7 +439,8 @@ impl Reader {
             aggregate,
             reads,
             anchor: None,
-            roles: Roles::default(),
+            infos: Infos::default(),
+            title: None,
             ready: true,
             failed: false,
         }
@@ -422,7 +451,8 @@ impl Reader {
             aggregate,
             reads,
             anchor: Some(anchor),
-            roles: Roles::default(),
+            infos: Infos::default(),
+            title: None,
             ready: true,
             failed: false,
         }
@@ -498,9 +528,11 @@ impl Reader {
         None
     }
 
-    /// The message a row carries, if any: a `message.updated.1` row only records a role, a draft
-    /// of a part opencode is still writing is superseded by a later row, and an unmodelled kind
-    /// of row is skipped.
+    /// The message a row carries, if any. A `message.updated.1` row records what its parts need
+    /// to know of their message and is a message itself only when it reports a failed model call;
+    /// a draft of a part opencode is still writing is superseded by a later row; a
+    /// `session.updated.1` row that leaves the title as it was is one of the many opencode writes
+    /// to touch a session; and an unmodelled kind of row is skipped.
     ///
     /// The row's `id` is not read here. It anchors the session, and a NULL one anchors as the
     /// empty string (see [`PageRow::identity`]), so a row whose payload is whole is decoded and
@@ -520,78 +552,158 @@ impl Reader {
             Err(err) => return Some(Err(MessageError::from(err))),
         };
         match classified {
-            EventKind::Role => {
-                self.learn(&data);
-                None
-            }
+            EventKind::Message => self.learn(&data).map(Ok),
             EventKind::Part => match OpencodeMessage::split_part(data) {
                 Ok((part, _)) if OpencodeMessage::is_draft(&part) => None,
                 Ok((part, time)) => {
                     let message_id = part.get("messageID").and_then(Value::as_str);
-                    let role = self.role(message_id).await;
-                    Some(Ok(OpencodeMessage::part(role, part, time)))
+                    let info = self.info(message_id).await;
+                    Some(Ok(OpencodeMessage::part(info, part, time)))
                 }
                 Err(err) => Some(Err(MessageError::from(err))),
             },
+            EventKind::Session => {
+                let message = OpencodeMessage::session(data)?;
+                let title = message.title();
+                if title.is_some() && title == self.title {
+                    return None;
+                }
+                self.title = title;
+                Some(Ok(message))
+            }
             EventKind::Unmapped => Some(Ok(OpencodeMessage::raw(kind, data))),
         }
     }
 
-    fn learn(&mut self, data: &Value) {
-        let info = data.get("info");
-        let id = info.and_then(|info| info.get("id")).and_then(Value::as_str);
-        let role = info.and_then(|info| info.get("role")).and_then(Value::as_str);
-        if let (Some(id), Some(role)) = (id, role) {
-            self.roles.insert(id, OpencodeMessage::role_of(role));
-        }
+    /// Records what a `message.updated.1` row says of its message, handing back the failure it
+    /// reports, if any.
+    fn learn(&mut self, data: &Value) -> Option<OpencodeMessage> {
+        let info = data.get("info")?;
+        let id = info.get("id").and_then(Value::as_str)?;
+        let learned = MessageInfo::of(id, info)?;
+        self.infos.insert(id, learned.clone());
+        OpencodeMessage::failure(id, learned, info)
     }
 
-    async fn role(&mut self, message_id: Option<&str>) -> Role {
-        let unknown = || Role::Other("unknown".to_owned());
+    /// What is known of the message `message_id`: from its `message.updated.1` row, or opencode's
+    /// `message` projection when that row is no longer to hand.
+    async fn info(&mut self, message_id: Option<&str>) -> MessageInfo {
         let Some(message_id) = message_id else {
-            return unknown();
+            return MessageInfo::unknown();
         };
-        if let Some(role) = self.roles.get(message_id) {
-            return role;
+        if let Some(info) = self.infos.get(message_id) {
+            return info;
         }
-        match self.reads.role(message_id).await {
-            Some(role) => {
-                self.roles.insert(message_id, role.clone());
-                role
+        match self.reads.info(message_id).await {
+            Some(info) => {
+                self.infos.insert(message_id, info.clone());
+                info
             }
-            None => unknown(),
+            None => MessageInfo::unknown(),
         }
     }
 }
 
-/// The roles a [`Reader`] has to hand, most recently used first.
-///
-/// Bounded, and small: opencode writes a message's `message.updated.1` row immediately before the
-/// parts that carry it, so a part asks for one of the newest roles of all. Keeping the rest would
-/// keep an entry per message for as long as the tail runs -- the history of every session anyone
-/// ever read, pinned by a tail that never prunes the sessions it has seen. Dropping one costs a
-/// lookup rather than a role: opencode's `message` projection records the same thing durably, and
-/// that is where [`Reader::role`] goes when this cannot answer.
-#[derive(Debug, Default)]
-struct Roles(VecDeque<(String, Role)>);
+/// What a part needs to know of the message it belongs to. opencode fixes all of it when it
+/// creates the message, so any `message.updated.1` row of a message says it for good.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MessageInfo {
+    role: Role,
+    /// The model call an assistant message is (see [`MessageInfo::turn_of`]).
+    turn: Option<String>,
+    /// The user message an assistant message answers (`parentID`).
+    parent: Option<String>,
+    /// `modelID`, of an assistant message.
+    model: Option<String>,
+    /// `path.cwd`, of an assistant message.
+    cwd: Option<String>,
+    /// A compaction summary (`summary: true`), whose text stands in for the conversation before
+    /// it.
+    summary: bool,
+}
 
-impl Roles {
-    /// How many messages' roles a session keeps.
-    const CAP: usize = 8;
-
-    /// The role of `message`, made the most recently used of those kept.
-    fn get(&mut self, message: &str) -> Option<Role> {
-        let at = self.0.iter().position(|(id, _)| id == message)?;
-        let kept = self.0.remove(at).expect("position() named an entry");
-        let role = kept.1.clone();
-        self.0.push_front(kept);
-        Some(role)
+impl MessageInfo {
+    fn unknown() -> Self {
+        Self {
+            role: Role::Other("unknown".to_owned()),
+            turn: None,
+            parent: None,
+            model: None,
+            cwd: None,
+            summary: false,
+        }
     }
 
-    /// Records `message`'s role, dropping the least recently used once [`Self::CAP`] are kept.
-    fn insert(&mut self, message: &str, role: Role) {
+    /// What `info`, the `Assistant` or `User` info of the message `id`, says. `None` when it
+    /// names no role.
+    fn of(id: &str, info: &Value) -> Option<Self> {
+        let role = OpencodeMessage::role_of(info.get("role")?.as_str()?);
+        if role != Role::Assistant {
+            return Some(Self {
+                role,
+                ..Self::unknown()
+            });
+        }
+        let text = |value: &Value| value.as_str().map(str::to_owned);
+        Some(Self {
+            role,
+            turn: Some(Self::turn_of(id, info)),
+            parent: text(&info["parentID"]),
+            model: text(&info["modelID"]),
+            cwd: text(&info["path"]["cwd"]),
+            summary: info["summary"].as_bool().unwrap_or_default(),
+        })
+    }
+
+    /// The model call an assistant message is: when it was created, and with which model.
+    ///
+    /// Not its id, because that is not the call's: forking a session (`Session.fork`) copies
+    /// every message into the new session under a fresh id, with the rest of its info -- the
+    /// creation time, the model, the tokens -- as it was, and every part likewise. Keyed on what
+    /// the copy keeps, the copy is the same call as its original and its usage is not counted
+    /// twice. opencode creates one assistant message per model call and stamps it to the
+    /// millisecond, so two calls of one model share this key only when they start in the same
+    /// millisecond -- parallel subagents can -- which the usage key of their steps then tells
+    /// apart (see [`OpencodeMessage::turn_id`]). A message whose info lacks any of these falls
+    /// back to its id.
+    fn turn_of(id: &str, info: &Value) -> String {
+        let created = epoch_millis(&info["time"]["created"]);
+        match (created, info["providerID"].as_str(), info["modelID"].as_str()) {
+            (Some(created), Some(provider), Some(model)) => format!("{created}:{provider}/{model}"),
+            _ => id.to_owned(),
+        }
+    }
+}
+
+/// What a [`Reader`] knows of its messages, most recently used first.
+///
+/// Bounded, and small: opencode writes a message's `message.updated.1` row immediately before the
+/// parts that carry it, so a part asks after one of the newest messages of all. Keeping the rest
+/// would keep an entry per message for as long as the tail runs -- the history of every session
+/// anyone ever read, pinned by a tail that never prunes the sessions it has seen. Dropping one
+/// costs a lookup rather than an answer: opencode's `message` projection records the same thing
+/// durably, and that is where [`Reader::info`] goes when this cannot answer.
+#[derive(Debug, Default)]
+struct Infos(VecDeque<(String, MessageInfo)>);
+
+impl Infos {
+    /// How many messages a session keeps what it knows of.
+    const CAP: usize = 8;
+
+    /// What is known of `message`, made the most recently used of those kept.
+    fn get(&mut self, message: &str) -> Option<MessageInfo> {
+        let at = self.0.iter().position(|(id, _)| id == message)?;
+        let kept = self.0.remove(at).expect("position() named an entry");
+        let info = kept.1.clone();
+        self.0.push_front(kept);
+        Some(info)
+    }
+
+    /// Records what is known of `message`, dropping the least recently used once [`Self::CAP`]
+    /// are kept.
+    fn insert(&mut self, message: &str, info: MessageInfo) {
         self.0.retain(|(id, _)| id != message);
-        self.0.push_front((message.to_owned(), role));
+        self.0.push_front((message.to_owned(), info));
         self.0.truncate(Self::CAP);
     }
 }
@@ -808,6 +920,7 @@ impl Reads {
     async fn aggregates(self: &Arc<Self>) -> Option<Vec<Aggregate>> {
         const SQL: &str = "SELECT aggregate_id, min(rowid) AS first FROM event WHERE type LIKE \
                            'message.updated.%' OR type LIKE 'message.part.updated.%' OR type LIKE \
+                           'session.created.%' OR type LIKE 'session.updated.%' OR type LIKE \
                            'session.next.%' GROUP BY aggregate_id ORDER BY first ASC";
         let rows: Vec<AggregateRow> = self
             .read("aggregate scan", |conn| {
@@ -817,18 +930,18 @@ impl Reads {
         Some(rows.into_iter().filter_map(|row| row.aggregate).collect())
     }
 
-    /// The role opencode's `message` projection records for `message_id` (its `data` is the
-    /// message info minus `id` and `sessionID`), for parts whose `message.updated.1` row predates
-    /// the session's start.
-    async fn role(self: &Arc<Self>, message_id: &str) -> Option<Role> {
-        let message_id = message_id.to_owned();
+    /// What opencode's `message` projection records of `message_id` (its `data` is the message
+    /// info minus `id` and `sessionID`), for parts whose `message.updated.1` row predates the
+    /// session's start.
+    async fn info(self: &Arc<Self>, message_id: &str) -> Option<MessageInfo> {
+        let id = message_id.to_owned();
         let data = self
-            .read("message role lookup", move |conn| {
+            .read("message info lookup", move |conn| {
                 Box::pin(async move {
                     query_scalar::<Sqlite, Option<Vec<u8>>>(
                         "SELECT data FROM message WHERE id = ?1",
                     )
-                    .bind(message_id)
+                    .bind(id)
                     .fetch_optional(conn)
                     .await
                 })
@@ -836,7 +949,7 @@ impl Reads {
             .await?
             .flatten()?;
         let info: Value = serde_json::from_slice(&data).ok()?;
-        info.get("role").and_then(Value::as_str).map(OpencodeMessage::role_of)
+        MessageInfo::of(message_id, &info)
     }
 }
 
@@ -977,8 +1090,13 @@ impl<'r> sqlx::FromRow<'r, SqliteRow> for AggregateRow {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EventKind {
-    Role,
+    /// `message.updated.1`: a message's info.
+    Message,
+    /// `message.part.updated.1`: one part of a message, as it was upserted.
     Part,
+    /// `session.created.1` / `session.updated.1`: the session's info.
+    Session,
+    /// A durable event this module does not model.
     Unmapped,
 }
 
@@ -1062,13 +1180,19 @@ impl<'r> sqlx::FromRow<'r, SqliteRow> for EventRow {
 }
 
 impl EventRow {
+    /// What a row of `kind` is to a session, or `None` for one no session reads: a revert's
+    /// removals (`message.removed.1`, `message.part.removed.1`; see the module docs) and a
+    /// deletion among them.
     fn classify(kind: &str) -> Option<EventKind> {
         match kind {
-            "message.updated.1" => Some(EventKind::Role),
+            "message.updated.1" => Some(EventKind::Message),
             "message.part.updated.1" => Some(EventKind::Part),
+            "session.created.1" | "session.updated.1" => Some(EventKind::Session),
             k if k.starts_with("session.next.")
                 || k.starts_with("message.updated.")
-                || k.starts_with("message.part.updated.") =>
+                || k.starts_with("message.part.updated.")
+                || k.starts_with("session.created.")
+                || k.starts_with("session.updated.") =>
             {
                 Some(EventKind::Unmapped)
             }
@@ -1161,16 +1285,105 @@ fn epoch_millis(value: &Value) -> Option<i64> {
     value.as_i64().or_else(|| value.as_f64().map(|ms| ms.round() as i64))
 }
 
+/// A token count: a finite number in opencode's schema, an integer in practice. A negative one
+/// (a provider's accounting gone wrong) counts as none.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "clamped to be non-negative; token counts fit u64 by a wide margin"
+)]
+fn tokens(value: &Value) -> Option<u64> {
+    value.as_u64().or_else(|| value.as_f64().map(|n| n.max(0.0).round() as u64))
+}
+
+/// One message of an opencode session.
+///
+/// Most are parts (`message.part.updated.1`): opencode stores a message as its info plus parts,
+/// and each part is delivered once finished, under its own id. What a part needs of its message
+/// -- role, model, cwd, the user message it answers -- comes from the message's info. A step's
+/// usage rides its `step-finish` part (see [`Message::usage`]).
+///
+/// The rest are rows of their own: a failed assistant message, under the message's id (a model
+/// call that fails before a single part is written leaves nothing else behind), and the
+/// session's title and parent, from its `session.created.1` / `session.updated.1` rows.
 #[derive(Debug, Clone)]
 pub struct OpencodeMessage {
     role: Role,
-    part: Value,
+    body: Body,
     time: Option<i64>,
+    /// The message a part or failure belongs to.
+    info: Option<MessageInfo>,
+}
+
+#[derive(Debug, Clone)]
+enum Body {
+    /// A part of a message.
+    Part(Value),
+    /// A message whose info reports `error`: its id and that info.
+    Failure {
+        id: String,
+        info: Value,
+    },
+    /// A session's info.
+    Session(Value),
+    /// A durable event this module does not model, whole.
+    Raw(Value),
 }
 
 impl OpencodeMessage {
-    const fn part(role: Role, part: Value, time: Option<i64>) -> Self {
-        Self { role, part, time }
+    /// A finished part of the message `info` describes.
+    ///
+    /// A `synthetic` text part is one opencode wrote into the message itself -- a file an `@`
+    /// mention read, an MCP resource, a plan-mode reminder, a subagent's result, the prompt that
+    /// resumes a session after compaction -- and an `ignored` one is context a client showed the
+    /// user and kept from the model. Neither was typed by anyone, so both are the harness's
+    /// ([`Role::System`]), whichever message they sit in.
+    fn part(info: MessageInfo, part: Value, time: Option<i64>) -> Self {
+        let injected = part["type"] == "text"
+            && (part["synthetic"].as_bool() == Some(true)
+                || part["ignored"].as_bool() == Some(true));
+        Self {
+            role: if injected {
+                Role::System
+            } else {
+                info.role.clone()
+            },
+            body: Body::Part(part),
+            time,
+            info: Some(info),
+        }
+    }
+
+    /// The failure `info`, the message `id`'s info, reports, if it reports one: `info.error`, set
+    /// when a model call is aborted or fails (`processor.ts` `halt`) and when a finished one is
+    /// refused (`prompt.ts`, a `content-filter` finish).
+    fn failure(id: &str, learned: MessageInfo, info: &Value) -> Option<Self> {
+        if learned.role != Role::Assistant || !info["error"].is_object() {
+            return None;
+        }
+        let time = &info["time"];
+        Some(Self {
+            role: Role::Assistant,
+            time: epoch_millis(&time["completed"]).or_else(|| epoch_millis(&time["created"])),
+            body: Body::Failure {
+                id: id.to_owned(),
+                info: info.clone(),
+            },
+            info: Some(learned),
+        })
+    }
+
+    /// A session's `session.created.1` or `session.updated.1` payload, as a row carrying its
+    /// title and the session it was spawned from. `None` for a payload with no info.
+    fn session(mut data: Value) -> Option<Self> {
+        let info = data.get_mut("info").filter(|info| info.is_object()).map(Value::take)?;
+        let time = &info["time"];
+        Some(Self {
+            role: Role::System,
+            time: epoch_millis(&time["updated"]).or_else(|| epoch_millis(&time["created"])),
+            body: Body::Session(info),
+            info: None,
+        })
     }
 
     /// A durable event this module does not model (`session.next.*`, or a newer version of a
@@ -1184,8 +1397,92 @@ impl OpencodeMessage {
             .and_then(epoch_millis);
         Self {
             role: Role::Other(unversioned(kind).to_owned()),
-            part: data,
+            body: Body::Raw(data),
             time,
+            info: None,
+        }
+    }
+
+    /// The part this message is, if it is one.
+    const fn as_part(&self) -> Option<&Value> {
+        match &self.body {
+            Body::Part(part) => Some(part),
+            _ => None,
+        }
+    }
+
+    /// The part this message is, if it is a `step-finish`: the end of one model call.
+    fn step_finish(&self) -> Option<&Value> {
+        self.as_part().filter(|part| part["type"] == "step-finish")
+    }
+
+    /// The assistant message this one belongs to, if any.
+    fn assistant(&self) -> Option<&MessageInfo> {
+        self.info.as_ref().filter(|info| info.role == Role::Assistant)
+    }
+
+    /// What an opencode error (`{name, data: {message, ..}}`) says happened.
+    fn error_text(error: &Value) -> String {
+        match error["data"]["message"].as_str() {
+            Some(message) if !message.is_empty() => message.to_owned(),
+            _ => error["name"].as_str().unwrap_or("error").to_owned(),
+        }
+    }
+
+    /// The stop reason of a step's `finish` (the AI SDK's finish reasons).
+    fn stop_reason_of(finish: &str) -> StopReason {
+        match finish {
+            "stop" => StopReason::EndTurn,
+            "length" => StopReason::MaxTokens,
+            "tool-calls" => StopReason::ToolUse,
+            "content-filter" => StopReason::Refusal,
+            "error" => StopReason::Error,
+            other => StopReason::Other(other.to_owned()),
+        }
+    }
+
+    /// What a part says. A `step-finish` says nothing: it carries its step's usage and why the
+    /// step ended, which are no conversation.
+    fn part_content(&self, part: &Value) -> Vec<Content> {
+        match part["type"].as_str() {
+            Some("text") => {
+                let text = part["text"].as_str().unwrap_or_default().to_owned();
+                if self.assistant().is_some_and(|info| info.summary) {
+                    vec![Content::Summary(text)]
+                } else {
+                    vec![Content::Text(text)]
+                }
+            }
+            Some("step-finish") => Vec::new(),
+            // an API error the call is retried after
+            Some("retry") => vec![Content::Error(Self::error_text(&part["error"]))],
+            Some("reasoning") => {
+                vec![Content::Reasoning(part["text"].as_str().unwrap_or_default().to_owned())]
+            }
+            Some("tool") => {
+                let call = ToolCallId::from(part["callID"].as_str().unwrap_or_default().to_owned());
+                let state = &part["state"];
+                let mut content = vec![Content::ToolUse(ToolUse {
+                    id: call.clone(),
+                    name: part["tool"].as_str().unwrap_or_default().to_owned(),
+                    input: state["input"].clone(),
+                })];
+                match state["status"].as_str() {
+                    Some("completed") => content.push(Content::ToolResult(ToolResult {
+                        call,
+                        output: state["output"].clone(),
+                        error: false,
+                    })),
+                    Some("error") => content.push(Content::ToolResult(ToolResult {
+                        call,
+                        output: state["error"].clone(),
+                        error: true,
+                    })),
+                    _ => {}
+                }
+                content
+            }
+            _ => vec![Content::Other(part.clone())],
         }
     }
 
@@ -1235,8 +1532,17 @@ impl OpencodeMessage {
 }
 
 impl Message for OpencodeMessage {
+    /// A part's id; a failed message's id; for a session's info, its id and title, so that a
+    /// title is delivered once however many rows repeat it.
     fn id(&self) -> Option<MessageId> {
-        self.part["id"].as_str().map(|id| MessageId::from(id.to_owned()))
+        let id = match &self.body {
+            Body::Part(value) | Body::Raw(value) => value["id"].as_str()?.to_owned(),
+            Body::Failure { id, .. } => id.clone(),
+            Body::Session(info) => {
+                format!("{}:title:{}", info["id"].as_str()?, info["title"].as_str()?)
+            }
+        };
+        Some(MessageId::from(id))
     }
 
     fn role(&self) -> Role {
@@ -1250,38 +1556,104 @@ impl Message for OpencodeMessage {
     }
 
     fn content(&self) -> Vec<Content> {
-        let part = &self.part;
-        match part["type"].as_str() {
-            Some("text") => {
-                vec![Content::Text(part["text"].as_str().unwrap_or_default().to_owned())]
+        match &self.body {
+            Body::Part(part) => self.part_content(part),
+            Body::Failure { info, .. } => vec![Content::Error(Self::error_text(&info["error"]))],
+            Body::Session(_) => Vec::new(),
+            Body::Raw(data) => vec![Content::Other(data.clone())],
+        }
+    }
+
+    fn model(&self) -> Option<String> {
+        self.assistant()?.model.clone()
+    }
+
+    /// A step's usage, from its `step-finish` part: one per model call, which is what opencode
+    /// reports usage for. The message's own `tokens` are not used, as opencode overwrites them
+    /// with each step's (`processor.ts`, `step-finish`) and a message of several steps would
+    /// report its last one only.
+    ///
+    /// opencode's `input` already leaves out the cached tokens, and its `output` the reasoning
+    /// ones (`Session.getUsage`), which are added back here: reasoning is billed as output.
+    fn usage(&self) -> Option<Usage> {
+        let counts = &self.step_finish()?["tokens"];
+        if !counts.is_object() {
+            return None;
+        }
+        let output = match (tokens(&counts["output"]), tokens(&counts["reasoning"])) {
+            (None, None) => None,
+            (output, reasoning) => {
+                Some(output.unwrap_or_default().saturating_add(reasoning.unwrap_or_default()))
             }
-            Some("reasoning") => {
-                vec![Content::Reasoning(part["text"].as_str().unwrap_or_default().to_owned())]
+        };
+        Some(Usage {
+            input: tokens(&counts["input"]),
+            output,
+            cache_read: tokens(&counts["cache"]["read"]),
+            cache_write: tokens(&counts["cache"]["write"]),
+        })
+    }
+
+    fn stop_reason(&self) -> Option<StopReason> {
+        match &self.body {
+            Body::Part(_) => self.step_finish()?["reason"].as_str().map(Self::stop_reason_of),
+            Body::Failure { info, .. } => Some(match info["error"]["name"].as_str() {
+                Some("MessageAbortedError") => StopReason::Aborted,
+                _ => StopReason::Error,
+            }),
+            Body::Session(_) | Body::Raw(_) => None,
+        }
+    }
+
+    fn cwd(&self) -> Option<PathBuf> {
+        match &self.body {
+            Body::Session(info) => info["directory"].as_str().map(PathBuf::from),
+            _ => self.assistant()?.cwd.as_deref().map(PathBuf::from),
+        }
+    }
+
+    /// The user message an assistant message's rows answer.
+    fn parent_id(&self) -> Option<MessageId> {
+        self.assistant()?.parent.clone().map(MessageId::from)
+    }
+
+    fn parent_session(&self) -> Option<SessionId> {
+        match &self.body {
+            Body::Session(info) => {
+                info["parentID"].as_str().map(|id| SessionId::from(id.to_owned()))
             }
-            Some("tool") => {
-                let call = ToolCallId::from(part["callID"].as_str().unwrap_or_default().to_owned());
-                let state = &part["state"];
-                let mut content = vec![Content::ToolUse(ToolUse {
-                    id: call.clone(),
-                    name: part["tool"].as_str().unwrap_or_default().to_owned(),
-                    input: state["input"].clone(),
-                })];
-                match state["status"].as_str() {
-                    Some("completed") => content.push(Content::ToolResult(ToolResult {
-                        call,
-                        output: state["output"].clone(),
-                        error: false,
-                    })),
-                    Some("error") => content.push(Content::ToolResult(ToolResult {
-                        call,
-                        output: state["error"].clone(),
-                        error: true,
-                    })),
-                    _ => {}
-                }
-                content
-            }
-            _ => vec![Content::Other(part.clone())],
+            _ => None,
+        }
+    }
+
+    /// The model call a row of an assistant message belongs to (see `MessageInfo::turn_of`).
+    ///
+    /// A `step-finish` part is one model call on its own, whose usage the key has to tell apart
+    /// from every other call's: it is its message's key and the counts it reports, which a fork's
+    /// copy of it keeps and which two calls that start in the same millisecond, or two steps of
+    /// one message, do not share.
+    fn turn_id(&self) -> Option<String> {
+        let turn = self.assistant().and_then(|info| info.turn.clone());
+        let Some(step) = self.step_finish() else {
+            return turn;
+        };
+        let turn = turn.or_else(|| step["messageID"].as_str().map(str::to_owned))?;
+        let counts = &step["tokens"];
+        let count = |value: &Value| tokens(value).unwrap_or_default();
+        Some(format!(
+            "{turn}#{}/{}/{}/{}/{}",
+            count(&counts["input"]),
+            count(&counts["output"]),
+            count(&counts["reasoning"]),
+            count(&counts["cache"]["read"]),
+            count(&counts["cache"]["write"]),
+        ))
+    }
+
+    fn title(&self) -> Option<String> {
+        match &self.body {
+            Body::Session(info) => info["title"].as_str().map(str::to_owned),
+            _ => None,
         }
     }
 }
@@ -1304,11 +1676,11 @@ mod tests {
     use crate::harnesstools::session::{CaptureError, Message, SessionEvent, Sessions};
 
     fn part_message(part: Value) -> OpencodeMessage {
-        OpencodeMessage {
+        let info = MessageInfo {
             role: Role::Assistant,
-            part,
-            time: Some(1_700_000_000_000),
-        }
+            ..MessageInfo::unknown()
+        };
+        OpencodeMessage::part(info, part, Some(1_700_000_000_000))
     }
 
     #[rstest]
@@ -2027,7 +2399,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("opencode.db");
         let db = event_db(&path).await;
-        insert_event(&db, "e1", "ses_old", "session.updated.1", r#"{"sessionID":"ses_old"}"#).await;
+        // a revert's removal and a deletion are rows no session reads
+        let removed = r#"{"sessionID":"ses_old","messageID":"msg_0"}"#;
+        insert_event(&db, "e1", "ses_old", "message.removed.1", removed).await;
         insert_event(&db, "e2", "ses_gone", "session.deleted.1", r#"{"sessionID":"ses_gone"}"#)
             .await;
         role_row(&db, "e3", "ses_1", "msg_1", "user").await;
@@ -2471,7 +2845,7 @@ mod tests {
         let path = dir.path().join("opencode.db");
         let db = event_db(&path).await;
         // alternated, so that a role read back from the wrong message shows
-        let messages: Vec<(String, &str)> = (0..Roles::CAP * 3)
+        let messages: Vec<(String, &str)> = (0..Infos::CAP * 3)
             .map(|i| (format!("msg_{i:02}"), ["user", "assistant"][i % 2]))
             .collect();
         for (i, (message, role)) in messages.iter().enumerate() {
@@ -2501,9 +2875,9 @@ mod tests {
         let written: Vec<Role> =
             messages.iter().map(|(_, role)| OpencodeMessage::role_of(role)).collect();
         assert_eq!(roles, written);
-        let kept = reader.lock().await.roles.0.len();
+        let kept = reader.lock().await.infos.0.len();
         assert!(
-            kept <= Roles::CAP,
+            kept <= Infos::CAP,
             "a session that read {} messages kept {kept} of their roles",
             messages.len()
         );
@@ -2686,8 +3060,8 @@ mod tests {
             .expect("no completed tool result");
         assert_eq!(tool.output, serde_json::json!({"stdout": "listing", "exit": 0}));
 
-        // session.created.1 and message.part.removed.1 yield nothing; the unmapped version and
-        // the session.next event surface whole, dated and named by their type
+        // a session.created.1 with no info and message.part.removed.1 yield nothing; the unmapped
+        // version and the session.next event surface whole, dated and named by their type
         let b = &by_session["ses_B"];
         let [b1, future, prompted] = b.as_slice() else {
             panic!("expected exactly three messages for ses_B, got {}", b.len());
@@ -2708,11 +3082,12 @@ mod tests {
         ));
     }
 
-    /// Repros from the opencode parser audit. Payloads follow opencode's durable event schemas
-    /// (`packages/schema/src/v1/session.ts`: `session.created`/`session.updated` carry the whole
-    /// `SessionInfo`, `message.updated` the whole `Assistant`/`User` info, `message.part.updated`
-    /// `{sessionID, part, time}`). Every test here is expected to FAIL until the parser is fixed.
-    mod repro {
+    /// What opencode's durable events capture, end to end. Payloads follow opencode's durable
+    /// event schemas (`packages/schema/src/v1/session.ts`: `session.created`/`session.updated`
+    /// carry the whole `SessionInfo`, `message.updated` the whole `Assistant`/`User` info,
+    /// `message.part.updated` `{sessionID, part, time}`) and the order `session/prompt.ts` and
+    /// `session/processor.ts` write them in.
+    mod captured {
         use super::*;
         use crate::harnesstools::session::model::{StopReason, Usage};
 
@@ -2736,6 +3111,13 @@ mod tests {
             out
         }
 
+        fn find<'a>(messages: &'a [OpencodeMessage], id: &str) -> &'a OpencodeMessage {
+            messages
+                .iter()
+                .find(|m| m.id() == Some(MessageId::from(id.to_owned())))
+                .unwrap_or_else(|| panic!("{id} was not delivered"))
+        }
+
         fn session_info(title: &str, parent: Option<&str>) -> Value {
             let mut info = serde_json::json!({
                 "id": SES, "slug": "s", "projectID": "p", "directory": "/work/proj",
@@ -2748,7 +3130,12 @@ mod tests {
             info
         }
 
-        /// An assistant `message.updated` as opencode's processor writes it at `step-finish`
+        async fn session_row(db: &Sqlite, id: &str, kind: &str, info: Value) {
+            let data = serde_json::json!({"sessionID": info["id"], "info": info});
+            insert_event(db, id, info["id"].as_str().unwrap(), kind, &data.to_string()).await;
+        }
+
+        /// An assistant message's info as opencode's processor writes it at `step-finish`
         /// (`processor.ts`: `assistantMessage.tokens = usage.tokens; finish = reason`).
         fn assistant_info(tokens_in: u64, error: Option<Value>) -> Value {
             let mut info = serde_json::json!({
@@ -2768,33 +3155,46 @@ mod tests {
             info
         }
 
-        /// One realistic assistant turn: user prompt, assistant info (zero tokens when created,
-        /// filled in at step-finish), a finished text part, a step-finish part.
+        async fn message_updated(db: &Sqlite, id: &str, info: &Value) {
+            let data = serde_json::json!({"sessionID": info["sessionID"], "info": info});
+            let session = info["sessionID"].as_str().unwrap();
+            insert_event(db, id, session, "message.updated.1", &data.to_string()).await;
+        }
+
+        async fn part_row(db: &Sqlite, id: &str, part: Value) {
+            let session = part["sessionID"].as_str().unwrap().to_owned();
+            let data = serde_json::json!({"sessionID": session, "time": 1_700_000_008_000i64,
+                                          "part": part});
+            insert_event(db, id, &session, "message.part.updated.1", &data.to_string()).await;
+        }
+
+        fn step_finish(session: &str, id: &str, message: &str, input: u64) -> Value {
+            serde_json::json!({
+                "id": id, "sessionID": session, "messageID": message, "type": "step-finish",
+                "reason": "stop", "cost": 0.0123,
+                "tokens": {"input": input, "output": 250, "reasoning": 40,
+                           "cache": {"read": 900, "write": 30}}})
+        }
+
+        /// One assistant turn as opencode writes it: the session, the user's prompt, the
+        /// assistant message (zero tokens when created, filled in at step-finish), a finished
+        /// text part, a step-finish part, and the message again once completed.
         async fn seed_turn(db: &Sqlite) {
-            let created =
-                serde_json::json!({"sessionID": SES, "info": session_info("New session", None)});
-            insert_event(db, "evt_00", SES, "session.created.1", &created.to_string()).await;
-            let user = serde_json::json!({"sessionID": SES, "info": {
+            session_row(db, "evt_00", "session.created.1", session_info("New session", None)).await;
+            let user = serde_json::json!({
                 "id": "msg_u1", "sessionID": SES, "role": "user",
                 "time": {"created": 1_700_000_000_500i64}, "agent": "build",
-                "model": {"providerID": "anthropic", "modelID": "claude-sonnet-4"}}});
-            insert_event(db, "evt_01", SES, "message.updated.1", &user.to_string()).await;
+                "model": {"providerID": "anthropic", "modelID": "claude-sonnet-4"}});
+            message_updated(db, "evt_01", &user).await;
             text_row(db, "evt_02", SES, "prt_u1", "msg_u1", "hello").await;
-            let fresh = serde_json::json!({"sessionID": SES, "info": assistant_info(0, None)});
-            insert_event(db, "evt_03", SES, "message.updated.1", &fresh.to_string()).await;
+            message_updated(db, "evt_03", &assistant_info(0, None)).await;
             let text = serde_json::json!({"sessionID": SES, "time": 1_700_000_005_000i64, "part": {
                 "id": "prt_a1", "sessionID": SES, "messageID": "msg_a1", "type": "text",
                 "text": "hi there",
                 "time": {"start": 1_700_000_002_000i64, "end": 1_700_000_005_000i64}}});
             insert_event(db, "evt_04", SES, "message.part.updated.1", &text.to_string()).await;
-            let step = serde_json::json!({"sessionID": SES, "time": 1_700_000_008_000i64, "part": {
-                "id": "prt_a2", "sessionID": SES, "messageID": "msg_a1", "type": "step-finish",
-                "reason": "stop", "cost": 0.0123,
-                "tokens": {"input": 1200, "output": 250, "reasoning": 40,
-                           "cache": {"read": 900, "write": 30}}}});
-            insert_event(db, "evt_05", SES, "message.part.updated.1", &step.to_string()).await;
-            let done = serde_json::json!({"sessionID": SES, "info": assistant_info(1200, None)});
-            insert_event(db, "evt_06", SES, "message.updated.1", &done.to_string()).await;
+            part_row(db, "evt_05", step_finish(SES, "prt_a2", "msg_a1", 1200)).await;
+            message_updated(db, "evt_06", &assistant_info(1200, None)).await;
         }
 
         async fn seeded() -> (tempfile::TempDir, Vec<OpencodeMessage>) {
@@ -2806,172 +3206,304 @@ mod tests {
             (dir, messages)
         }
 
+        /// The usage opencode reports on the message and again on its step-finish part is
+        /// captured once, from the step. opencode's `output` leaves the reasoning tokens out
+        /// (`Session.getUsage`: `output: outputTokens - reasoningTokens`), and they are billed
+        /// as output (ccusage and tokscale both add them back), so 250 + 40.
         #[rstest]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn repro_assistant_usage_is_never_captured() {
+        async fn a_turns_usage_is_captured_once_from_its_step() {
             let (_dir, messages) = seeded().await;
-            let usage: Vec<Usage> = messages.iter().filter_map(Message::usage).collect();
+            let usage: Vec<(Option<MessageId>, Usage)> =
+                messages.iter().filter_map(|m| Some((m.id(), m.usage()?))).collect();
+            assert_eq!(usage, vec![(Some(MessageId::from("prt_a2".to_owned())), Usage {
+                input: Some(1200),
+                output: Some(290),
+                cache_read: Some(900),
+                cache_write: Some(30),
+            })]);
+            let step = find(&messages, "prt_a2");
+            assert!(step.content().is_empty());
+            assert_eq!(step.stop_reason(), Some(StopReason::EndTurn));
             assert_eq!(
-                usage,
-                vec![Usage {
-                    input: Some(1200),
-                    output: Some(250),
-                    cache_read: Some(900),
-                    cache_write: Some(30),
-                }],
-                "opencode reports the turn's tokens on message.updated and step-finish; exactly \
-                 one captured row should carry them"
+                step.turn_id().as_deref(),
+                Some("1700000001000:anthropic/claude-sonnet-4#1200/250/40/900/30")
             );
+            assert_eq!(step.parent_id(), Some(MessageId::from("msg_u1".to_owned())));
         }
 
+        /// Every row of an assistant message says which model wrote it, where, in which call,
+        /// and which user message it answers; a user's row says none of it.
         #[rstest]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn repro_assistant_model_is_never_captured() {
+        async fn an_assistant_part_carries_its_messages_context() {
             let (_dir, messages) = seeded().await;
-            assert!(
-                messages.iter().any(|m| m.model().as_deref() == Some("claude-sonnet-4")),
-                "no captured row names the model (message.updated info.modelID)"
+            let reply = find(&messages, "prt_a1");
+            assert_eq!(reply.role(), Role::Assistant);
+            assert_eq!(reply.model().as_deref(), Some("claude-sonnet-4"));
+            assert_eq!(reply.cwd(), Some(PathBuf::from("/work/proj/sub")));
+            assert_eq!(reply.parent_id(), Some(MessageId::from("msg_u1".to_owned())));
+            assert_eq!(reply.turn_id().as_deref(), Some("1700000001000:anthropic/claude-sonnet-4"));
+            assert_eq!(reply.stop_reason(), None);
+            assert_eq!(reply.usage(), None);
+
+            let prompt = find(&messages, "prt_u1");
+            assert_eq!(prompt.role(), Role::User);
+            assert_eq!(
+                (prompt.model(), prompt.cwd(), prompt.parent_id(), prompt.turn_id()),
+                (None, None, None, None)
             );
         }
 
+        /// A message's info, read back from opencode's `message` projection when its
+        /// `message.updated.1` row is not in the part of the log a session reads, says the same.
         #[rstest]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn repro_assistant_cwd_is_never_captured() {
-            let (_dir, messages) = seeded().await;
-            assert!(
-                messages.iter().any(|m| m.cwd() == Some(PathBuf::from("/work/proj/sub"))),
-                "no captured row carries the cwd (message.updated info.path.cwd)"
+        async fn a_parts_context_is_looked_up_when_its_message_row_is_not_to_hand() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("opencode.db");
+            let db = event_db(&path).await;
+            let mut info = assistant_info(1200, None);
+            let data = {
+                let object = info.as_object_mut().unwrap();
+                object.remove("id");
+                object.remove("sessionID");
+                info.to_string()
+            };
+            query::<sqlx::Sqlite>(
+                "INSERT INTO message (id, session_id, time_created, time_updated, data) VALUES \
+                 ('msg_a1', ?1, 0, 0, ?2)",
+            )
+            .bind(SES)
+            .bind(data)
+            .execute(&mut *db.pool().acquire().await.unwrap())
+            .await
+            .unwrap();
+            part_row(&db, "evt_00", step_finish(SES, "prt_a2", "msg_a1", 1200)).await;
+
+            let messages = backfill(&path).await;
+            let step = find(&messages, "prt_a2");
+            assert_eq!(step.role(), Role::Assistant);
+            assert_eq!(step.model().as_deref(), Some("claude-sonnet-4"));
+            assert_eq!(
+                step.turn_id().as_deref(),
+                Some("1700000001000:anthropic/claude-sonnet-4#1200/250/40/900/30")
             );
         }
 
+        /// `Session.fork` copies every message and part into the new session under fresh ids
+        /// and with everything else -- times, model, tokens -- as it was: the copy of a step is
+        /// the same model call as its original, and names the same turn so its usage is counted
+        /// once.
         #[rstest]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn repro_assistant_stop_reason_is_never_captured() {
-            let (_dir, messages) = seeded().await;
-            assert!(
-                messages.iter().any(|m| m.stop_reason().is_some()),
-                "no captured row carries the stop reason (info.finish / step-finish.reason)"
-            );
+        async fn a_forked_copy_of_a_step_is_the_same_turn_as_its_original() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("opencode.db");
+            let db = event_db(&path).await;
+            seed_turn(&db).await;
+            let mut fork = session_info("New session (fork #1)", None);
+            fork["id"] = Value::from("ses_F");
+            session_row(&db, "evt_f0", "session.created.1", fork).await;
+            let user = serde_json::json!({
+                "id": "msg_fu1", "sessionID": "ses_F", "role": "user",
+                "time": {"created": 1_700_000_000_500i64}, "agent": "build",
+                "model": {"providerID": "anthropic", "modelID": "claude-sonnet-4"}});
+            message_updated(&db, "evt_f1", &user).await;
+            text_row(&db, "evt_f2", "ses_F", "prt_fu1", "msg_fu1", "hello").await;
+            let mut copy = assistant_info(1200, None);
+            copy["id"] = Value::from("msg_fa1");
+            copy["sessionID"] = Value::from("ses_F");
+            copy["parentID"] = Value::from("msg_fu1");
+            message_updated(&db, "evt_f3", &copy).await;
+            part_row(&db, "evt_f4", step_finish("ses_F", "prt_fa2", "msg_fa1", 1200)).await;
+
+            let messages = backfill(&path).await;
+            let (original, copy) = (find(&messages, "prt_a2"), find(&messages, "prt_fa2"));
+            assert!(original.usage().is_some());
+            assert_eq!(copy.usage(), original.usage());
+            assert_eq!(copy.turn_id(), original.turn_id());
+            assert_eq!(copy.parent_id(), Some(MessageId::from("msg_fu1".to_owned())));
         }
 
+        /// A message of several steps -- a retried stream, an older opencode that ran many steps
+        /// per message -- reports each step's usage on its own step-finish, and each is a model
+        /// call of its own.
         #[rstest]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn repro_assistant_parts_do_not_link_to_the_user_message() {
-            let (_dir, messages) = seeded().await;
-            let reply = messages
-                .iter()
-                .find(|m| m.id() == Some(MessageId::from("prt_a1".to_owned())))
-                .expect("the assistant text is delivered");
-            assert!(
-                reply.parent_id().is_some() || reply.turn_id().is_some(),
-                "the assistant text carries neither its message id (turn) nor a link to the user \
-                 message it answers (info.parentID)"
-            );
+        async fn each_step_of_a_message_is_a_turn_of_its_own() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("opencode.db");
+            let db = event_db(&path).await;
+            message_updated(&db, "evt_00", &assistant_info(0, None)).await;
+            part_row(&db, "evt_01", step_finish(SES, "prt_s1", "msg_a1", 1000)).await;
+            part_row(&db, "evt_02", step_finish(SES, "prt_s2", "msg_a1", 2000)).await;
+
+            let messages = backfill(&path).await;
+            let turns: Vec<String> = messages.iter().filter_map(Message::turn_id).collect();
+            assert_eq!(turns, [
+                "1700000001000:anthropic/claude-sonnet-4#1000/250/40/900/30",
+                "1700000001000:anthropic/claude-sonnet-4#2000/250/40/900/30",
+            ]);
+            let inputs: Vec<Option<u64>> =
+                messages.iter().filter_map(|m| Some(m.usage()?.input)).collect();
+            assert_eq!(inputs, [Some(1000), Some(2000)]);
         }
 
-        /// An assistant turn that fails before any part is written (auth error, API error, an
-        /// abort before the first token) exists only as `message.updated` with `info.error`.
+        /// A model call that fails or is aborted exists only as its message's info with
+        /// `error`, if it fails before a single part is written: that is a row of its own.
         #[rstest]
         #[case::aborted(
-            serde_json::json!({"name": "MessageAbortedError", "data": {"message": "aborted"}})
+            serde_json::json!({"name": "MessageAbortedError", "data": {"message": "aborted"}}),
+            StopReason::Aborted,
+            "aborted"
         )]
-        #[case::api(serde_json::json!({
-            "name": "APIError", "data": {"message": "overloaded", "isRetryable": true}
-        }))]
+        #[case::api(
+            serde_json::json!({
+                "name": "APIError", "data": {"message": "overloaded", "isRetryable": true}
+            }),
+            StopReason::Error,
+            "overloaded"
+        )]
+        #[case::output_length(
+            serde_json::json!({"name": "MessageOutputLengthError", "data": {}}),
+            StopReason::Error,
+            "MessageOutputLengthError"
+        )]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn repro_a_failed_assistant_turn_is_lost(#[case] error: Value) {
+        async fn a_failed_assistant_turn_is_captured(
+            #[case] error: Value,
+            #[case] reason: StopReason,
+            #[case] text: &str,
+        ) {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("opencode.db");
             let db = event_db(&path).await;
             role_row(&db, "evt_00", SES, "msg_u1", "user").await;
             text_row(&db, "evt_01", SES, "prt_u1", "msg_u1", "hello").await;
-            let failed =
-                serde_json::json!({"sessionID": SES, "info": assistant_info(0, Some(error))});
-            insert_event(&db, "evt_02", SES, "message.updated.1", &failed.to_string()).await;
+            message_updated(&db, "evt_02", &assistant_info(0, None)).await;
+            message_updated(&db, "evt_03", &assistant_info(0, Some(error))).await;
+
             let messages = backfill(&path).await;
-            assert!(
-                messages.iter().any(|m| matches!(
-                    m.stop_reason(),
-                    Some(StopReason::Error | StopReason::Aborted)
-                )),
-                "the failed turn leaves no trace: got {} rows, none with an error",
-                messages.len()
+            assert_eq!(messages.len(), 2, "the prompt and the failure");
+            let failed = find(&messages, "msg_a1");
+            assert_eq!(failed.role(), Role::Assistant);
+            assert_eq!(failed.content(), vec![Content::Error(text.to_owned())]);
+            assert_eq!(failed.stop_reason(), Some(reason));
+            assert_eq!(failed.timestamp().unwrap().unix_timestamp(), 1_700_000_009);
+            assert_eq!(failed.model().as_deref(), Some("claude-sonnet-4"));
+            assert_eq!(failed.parent_id(), Some(MessageId::from("msg_u1".to_owned())));
+            assert_eq!(
+                failed.turn_id().as_deref(),
+                Some("1700000001000:anthropic/claude-sonnet-4")
             );
+            assert_eq!(failed.usage(), None);
         }
 
+        /// opencode writes `session.updated` on every prompt (`touch`) and whenever anything of
+        /// the session changes; its title is delivered when it is first seen and each time it
+        /// changes.
         #[rstest]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn repro_session_title_is_never_captured() {
+        async fn the_session_title_is_captured_as_it_changes() {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("opencode.db");
             let db = event_db(&path).await;
             seed_turn(&db).await;
-            // opencode's ensureTitle -> setTitle publishes session.updated with the full info
-            let retitled = serde_json::json!({
-                "sessionID": SES, "info": session_info("Fix the flaky test", None)
-            });
-            insert_event(&db, "evt_07", SES, "session.updated.1", &retitled.to_string()).await;
+            let touched = session_info("New session", None);
+            session_row(&db, "evt_07", "session.updated.1", touched).await;
+            // ensureTitle -> setTitle
+            let titled = session_info("Fix the flaky test", None);
+            session_row(&db, "evt_08", "session.updated.1", titled.clone()).await;
+            session_row(&db, "evt_09", "session.updated.1", titled).await;
+
             let messages = backfill(&path).await;
-            assert!(
-                messages.iter().any(|m| m.title().as_deref() == Some("Fix the flaky test")),
-                "the generated title (session.updated.1 info.title) is never surfaced"
-            );
+            let titles: Vec<(Option<MessageId>, String)> =
+                messages.iter().filter_map(|m| Some((m.id(), m.title()?))).collect();
+            assert_eq!(titles, [
+                (Some(MessageId::from("ses_R:title:New session".to_owned())), "New session".into()),
+                (
+                    Some(MessageId::from("ses_R:title:Fix the flaky test".to_owned())),
+                    "Fix the flaky test".into()
+                ),
+            ]);
+            let session = find(&messages, "ses_R:title:New session");
+            assert_eq!(session.role(), Role::System);
+            assert!(session.content().is_empty());
+            assert_eq!(session.cwd(), Some(PathBuf::from("/work/proj")));
         }
 
         /// A task-tool subagent session is created with `parentID` (`tool/task.ts`).
         #[rstest]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn repro_child_session_parent_is_lost() {
+        async fn a_child_session_names_its_parent() {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("opencode.db");
             let db = event_db(&path).await;
-            let created = serde_json::json!({
-                "sessionID": SES, "info": session_info("sub", Some("ses_parent"))
-            });
-            insert_event(&db, "evt_00", SES, "session.created.1", &created.to_string()).await;
+            let created = session_info("sub", Some("ses_parent"));
+            session_row(&db, "evt_00", "session.created.1", created).await;
             role_row(&db, "evt_01", SES, "msg_u1", "user").await;
             text_row(&db, "evt_02", SES, "prt_u1", "msg_u1", "do the subtask").await;
+
             let messages = backfill(&path).await;
-            assert!(!messages.is_empty());
-            assert!(
-                messages
-                    .iter()
-                    .any(|m| m.parent_session() == Some(SessionId::from("ses_parent".to_owned()))),
-                "the subagent session's parent (session.created.1 info.parentID) is dropped"
-            );
+            let parents: Vec<SessionId> =
+                messages.iter().filter_map(Message::parent_session).collect();
+            assert_eq!(parents, [SessionId::from("ses_parent".to_owned())]);
         }
 
         /// `@file` in a prompt makes opencode run the Read tool itself and store its output as a
-        /// `synthetic` text part of the *user* message (`session/prompt.ts`).
+        /// `synthetic` text part of the *user* message (`session/prompt.ts`); ACP content meant
+        /// for the user alone is stored `ignored` (`acp/content.ts`). Neither was typed.
         #[rstest]
+        #[case::synthetic("synthetic")]
+        #[case::ignored("ignored")]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn repro_synthetic_file_contents_surface_as_user_text() {
+        async fn text_the_harness_injected_is_the_systems(#[case] flag: &str) {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("opencode.db");
             let db = event_db(&path).await;
             role_row(&db, "evt_00", SES, "msg_u1", "user").await;
             text_row(&db, "evt_01", SES, "prt_u1", "msg_u1", "look at @config.env").await;
-            let synthetic = serde_json::json!({"sessionID": SES, "time": 1_700_000_000_000i64,
-                "part": {
-                    "id": "prt_u2", "sessionID": SES, "messageID": "msg_u1", "type": "text",
-                    "synthetic": true, "text": "<file>\n00001| DB_HOST=prod.internal\n</file>"}});
-            insert_event(&db, "evt_02", SES, "message.part.updated.1", &synthetic.to_string())
-                .await;
+            let mut injected = serde_json::json!({
+                "id": "prt_u2", "sessionID": SES, "messageID": "msg_u1", "type": "text",
+                "text": "<file>\n00001| DB_HOST=prod.internal\n</file>"});
+            injected[flag] = Value::Bool(true);
+            part_row(&db, "evt_02", injected).await;
+
             let messages = backfill(&path).await;
-            let injected = messages
-                .iter()
-                .find(|m| m.id() == Some(MessageId::from("prt_u2".to_owned())))
-                .expect("delivered");
-            assert!(
-                !(injected.role() == Role::User
-                    && matches!(injected.content().as_slice(), [Content::Text(_)])),
-                "the Read tool's output is captured as text the user typed: {:?}",
-                injected.content()
-            );
+            assert_eq!(find(&messages, "prt_u1").role(), Role::User);
+            let injected = find(&messages, "prt_u2");
+            assert_eq!(injected.role(), Role::System);
+            assert!(matches!(injected.content().as_slice(), [Content::Text(_)]));
         }
 
-        /// `/undo` (session/revert.ts) removes messages and parts with durable
-        /// `message.removed.1` / `message.part.removed.1` events.
+        /// A compaction writes its summary as the text of an assistant message marked `summary`
+        /// (`session/compaction.ts`).
+        #[rstest]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_compaction_summary_is_a_summary() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("opencode.db");
+            let db = event_db(&path).await;
+            let mut info = assistant_info(0, None);
+            info["summary"] = Value::Bool(true);
+            info["mode"] = Value::from("compaction");
+            message_updated(&db, "evt_00", &info).await;
+            text_row(&db, "evt_01", SES, "prt_a1", "msg_a1", "we fixed the test").await;
+
+            let messages = backfill(&path).await;
+            assert_eq!(find(&messages, "prt_a1").content(), vec![Content::Summary(
+                "we fixed the test".into()
+            )]);
+        }
+
+        /// `/undo` (`session/revert.ts`) removes messages and parts with durable
+        /// `message.removed.1` / `message.part.removed.1` rows, written when the next prompt
+        /// commits the revert. They are left unread, and what was captured stands: the reverted
+        /// turns did happen and did cost their tokens; captured rows are immutable, so nothing
+        /// downstream could retract them; and no content says "retracted", so a marker would be
+        /// made-up text, one per removed message and part, dated at the next prompt rather than
+        /// the undo.
         #[rstest]
         #[case::part(
             "message.part.removed.1",
@@ -2982,18 +3514,72 @@ mod tests {
             serde_json::json!({"sessionID": SES, "messageID": "msg_u1"})
         )]
         #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-        async fn repro_a_revert_is_invisible(#[case] kind: &str, #[case] data: Value) {
+        async fn a_revert_leaves_what_was_captured_as_it_stands(
+            #[case] kind: &str,
+            #[case] data: Value,
+        ) {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("opencode.db");
             let db = event_db(&path).await;
             role_row(&db, "evt_00", SES, "msg_u1", "user").await;
             text_row(&db, "evt_01", SES, "prt_u1", "msg_u1", "oops").await;
             insert_event(&db, "evt_02", SES, kind, &data.to_string()).await;
+
             let messages = backfill(&path).await;
-            assert!(
-                messages.len() > 1,
-                "the removal is dropped; the reverted part stays captured as if it stood"
-            );
+            let delivered: Vec<(Option<MessageId>, Vec<Content>)> =
+                messages.iter().map(|m| (m.id(), m.content())).collect();
+            assert_eq!(delivered, [(Some(MessageId::from("prt_u1".to_owned())), vec![
+                Content::Text("oops".into())
+            ])]);
         }
+    }
+
+    #[rstest]
+    #[case::stop("stop", StopReason::EndTurn)]
+    #[case::length("length", StopReason::MaxTokens)]
+    #[case::tool_calls("tool-calls", StopReason::ToolUse)]
+    #[case::content_filter("content-filter", StopReason::Refusal)]
+    #[case::error("error", StopReason::Error)]
+    #[case::unknown("unknown", StopReason::Other("unknown".into()))]
+    fn a_step_says_why_it_ended(#[case] reason: &str, #[case] expected: StopReason) {
+        let step = part_message(serde_json::json!({
+            "id": "prt_1", "type": "step-finish", "reason": reason,
+            "tokens": {"input": 1, "output": 2, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+        }));
+        assert_eq!(step.stop_reason(), Some(expected));
+    }
+
+    #[rstest]
+    #[case::whole(
+        serde_json::json!({"input": 10, "output": 5, "reasoning": 2, "cache": {"read": 3, "write": 1}}),
+        Some(Usage { input: Some(10), output: Some(7), cache_read: Some(3), cache_write: Some(1) })
+    )]
+    #[case::fractional_and_negative(
+        serde_json::json!({"input": 10.4, "output": -5, "reasoning": 2, "cache": {"read": 3}}),
+        Some(Usage { input: Some(10), output: Some(2), cache_read: Some(3), cache_write: None })
+    )]
+    #[case::no_output_at_all(
+        serde_json::json!({"input": 10}),
+        Some(Usage { input: Some(10), output: None, cache_read: None, cache_write: None })
+    )]
+    #[case::no_tokens(Value::Null, None)]
+    fn a_steps_usage_counts_reasoning_as_output(
+        #[case] tokens: Value,
+        #[case] expected: Option<Usage>,
+    ) {
+        let step = part_message(serde_json::json!({
+            "id": "prt_1", "type": "step-finish", "reason": "stop", "tokens": tokens,
+        }));
+        assert_eq!(step.usage(), expected);
+    }
+
+    #[rstest]
+    fn a_retry_reports_the_error_it_retries_after() {
+        let retry = part_message(serde_json::json!({
+            "id": "prt_1", "type": "retry", "attempt": 1, "time": {"created": 1},
+            "error": {"name": "APIError", "data": {"message": "overloaded", "isRetryable": true}},
+        }));
+        assert_eq!(retry.content(), vec![Content::Error("overloaded".into())]);
+        assert_eq!(retry.stop_reason(), None);
     }
 }
