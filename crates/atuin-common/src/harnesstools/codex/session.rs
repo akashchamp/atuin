@@ -314,8 +314,13 @@ pub struct CodexMessage {
     context: LineContext,
 }
 
-/// Whether a command output reports a non-zero exit, in either shape Codex has used: the
-/// `Process exited with code N` header, or an `"exit_code":N` field in a JSON envelope.
+/// Whether a command output reports a non-zero exit, in any shape Codex writes one:
+/// - a JSON envelope with `exit_code`, top-level or (older rollouts) under `metadata`;
+/// - a text header ahead of the `Output:` line (codex-rs `tools/mod.rs`
+///   `format_exec_output_for_model`: `Exit code: N`; `tools/context.rs` `response_header`:
+///   `Process exited with code N`).
+///
+/// Only the header is read, so a command whose output quotes such a line cannot flip it.
 fn codex_output_failed(output: &serde_json::Value) -> bool {
     let texts: Vec<&str> = match output {
         serde_json::Value::String(s) => vec![s],
@@ -324,18 +329,22 @@ fn codex_output_failed(output: &serde_json::Value) -> bool {
         }
         _ => Vec::new(),
     };
-    // The last occurrence: the header follows the output, which may quote an earlier one.
-    texts.iter().any(|text| {
-        ["Process exited with code ", "\"exit_code\":"].iter().any(|marker| {
-            text.rfind(marker).is_some_and(|at| {
-                let code: String = text[at + marker.len()..]
-                    .trim_start()
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit() || *c == '-')
-                    .collect();
-                code.parse::<i64>().is_ok_and(|c| c != 0)
-            })
-        })
+    texts.iter().any(|text| exit_code(text).is_some_and(|code| code != 0))
+}
+
+/// The exit code one command output reports, if it reports one.
+fn exit_code(text: &str) -> Option<i64> {
+    if let Ok(serde_json::Value::Object(envelope)) = serde_json::from_str(text) {
+        return envelope
+            .get("exit_code")
+            .or_else(|| envelope.get("metadata").and_then(|m| m.get("exit_code")))
+            .and_then(serde_json::Value::as_i64);
+    }
+    text.lines().take_while(|line| line.trim_end() != "Output:").find_map(|line| {
+        ["Exit code: ", "Process exited with code "]
+            .iter()
+            .find_map(|marker| line.strip_prefix(marker))
+            .and_then(|code| code.trim().parse().ok())
     })
 }
 
@@ -391,6 +400,18 @@ fn is_contextual_user_text(text: &str) -> bool {
             .is_some_and(|(key, _)| text.ends_with(&format!("</external_{key}>")))
 }
 
+/// The command a user ran from Codex's prompt, when `text` is the fragment Codex records for it
+/// (codex-rs `context/user_shell_command.rs`: `<user_shell_command>` wrapping `<command>` and a
+/// `<result>` holding the output). The command is what the user typed; the result is execution
+/// output, which is not kept.
+fn user_shell_command(text: &str) -> Option<&str> {
+    let body =
+        text.trim().strip_prefix("<user_shell_command>")?.strip_suffix("</user_shell_command>")?;
+    let (_, rest) = body.split_once("<command>")?;
+    let (command, _) = rest.split_once("</command>")?;
+    Some(command.trim())
+}
+
 /// A stable key for one `TokenUsage` object, for lines that carry no id of their own.
 fn usage_key(usage: &serde_json::Value) -> Option<String> {
     let field = |name: &str| usage.get(name).and_then(serde_json::Value::as_u64).unwrap_or(0);
@@ -428,7 +449,12 @@ impl CodexMessage {
     fn block(value: &serde_json::Value) -> Content {
         match value["type"].as_str() {
             Some("input_text" | "output_text" | "text") => {
-                Content::Text(value["text"].as_str().unwrap_or_default().to_owned())
+                let text = value["text"].as_str().unwrap_or_default();
+                // Recorded the way Claude Code replays one of its `!` commands.
+                user_shell_command(text).map_or_else(
+                    || Content::Text(text.to_owned()),
+                    |cmd| Content::Text(format!("! {cmd}")),
+                )
             }
             _ => Content::Other(value.clone()),
         }
@@ -524,7 +550,9 @@ impl CodexMessage {
         self.payload.as_ref().and_then(|p| p["content"].as_array()).is_some_and(|blocks| {
             blocks.iter().any(|block| {
                 block["type"] == "input_text"
-                    && block["text"].as_str().is_some_and(is_contextual_user_text)
+                    && block["text"].as_str().is_some_and(|t| {
+                        is_contextual_user_text(t) && user_shell_command(t).is_none()
+                    })
             })
         })
     }
@@ -899,14 +927,39 @@ mod tests {
     }
 
     #[rstest]
-    #[case(serde_json::json!("ok\nProcess exited with code 0"), false)]
-    #[case(serde_json::json!("boom\nProcess exited with code 2"), true)]
-    #[case(serde_json::json!([{"type": "output_text", "text": "{\"output\":\"x\",\"exit_code\":0}"}]), false)]
-    #[case(serde_json::json!([{"type": "output_text", "text": "{\"output\":\"x\",\"exit_code\":1}"}]), true)]
-    #[case(serde_json::json!("plain text"), false)]
-    #[case(serde_json::json!("killed\nProcess exited with code -9"), true)]
-    #[case(serde_json::json!("log: Process exited with code 1\nProcess exited with code 0"), false)]
-    #[case(serde_json::json!([{"type": "output_text", "text": "{\"output\": \"x\", \"exit_code\": 3}"}]), true)]
+    #[case::exec_ok(serde_json::json!("Exit code: 0\nWall time: 0.1 seconds\nOutput:\nok"), false)]
+    #[case::exec_failed(serde_json::json!("Exit code: 2\nWall time: 0.1 seconds\nOutput:\nboom"), true)]
+    #[case::unified_ok(
+        serde_json::json!("Chunk ID: c1\nWall time: 0.2000 seconds\nProcess exited with code 0\nOutput:\nok"),
+        false
+    )]
+    #[case::unified_killed(
+        serde_json::json!("Wall time: 0.2000 seconds\nProcess exited with code -9\nOutput:\n"),
+        true
+    )]
+    #[case::unified_still_running(
+        serde_json::json!("Wall time: 1.0000 seconds\nProcess running with session ID 7\nOutput:\npartial"),
+        false
+    )]
+    #[case::output_quotes_a_failure(
+        serde_json::json!("Exit code: 0\nWall time: 0.1 seconds\nOutput:\nExit code: 1\nProcess exited with code 1"),
+        false
+    )]
+    #[case::output_quotes_a_success(
+        serde_json::json!("Exit code: 1\nWall time: 0.1 seconds\nOutput:\nExit code: 0"),
+        true
+    )]
+    #[case::json_ok(serde_json::json!([{"type": "output_text", "text": "{\"output\":\"x\",\"exit_code\":0}"}]), false)]
+    #[case::json_failed(serde_json::json!([{"type": "output_text", "text": "{\"output\":\"x\",\"exit_code\":1}"}]), true)]
+    #[case::json_output_quotes_a_failure(
+        serde_json::json!("{\"output\":\"\\\"exit_code\\\":1\",\"exit_code\":0}"),
+        false
+    )]
+    #[case::legacy_metadata(
+        serde_json::json!("{\"output\":\"x\",\"metadata\":{\"exit_code\":1,\"duration_seconds\":0.1}}"),
+        true
+    )]
+    #[case::plain_text(serde_json::json!("plain text"), false)]
     fn tool_output_error_is_derived_from_exit_code(
         #[case] output: serde_json::Value,
         #[case] error: bool,
@@ -1457,6 +1510,21 @@ mod tests {
                 "content": [{"type": "input_text", "text": text}]},
         }));
         assert_eq!(m.role(), Role::User);
+    }
+
+    /// A command the user ran from the prompt keeps what they typed, never its output.
+    #[rstest]
+    fn a_user_shell_command_keeps_the_command_not_its_output() {
+        let text = "<user_shell_command>\n<command>\ncat .env\n</command>\n<result>\nExit code: \
+                    0\nDuration: 0.0100 \
+                    seconds\nOutput:\nDB_PASSWORD=hunter2\n</result>\n</user_shell_command>";
+        let m = line(&serde_json::json!({
+            "type": "response_item",
+            "payload": {"type": "message", "role": "user",
+                "content": [{"type": "input_text", "text": text}]},
+        }));
+        assert_eq!(m.role(), Role::User);
+        assert_eq!(m.content(), vec![Content::Text("! cat .env".to_owned())]);
     }
 
     /// `developer` is the Responses API system role.

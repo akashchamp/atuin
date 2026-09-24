@@ -296,12 +296,14 @@ impl AiSessionDatabase {
         let preview = Self::preview_text(msg);
         let before = Self::session_key(&mut tx, harness, session_id).await?;
 
-        // Usage is not folded in here: it is attributed per model call below.
+        // Usage is not folded in here: it is attributed per model call below. A structural row
+        // (usage, title, session context, a tree node with nothing to show) is no message.
+        let counted = i64::from(!msg.content.is_empty());
         db::query(
             "INSERT INTO sessions (
                 harness, session_id, parent_harness, parent_session_id, cwd, git_branch, model,
                 started_at, updated_at, message_count, title, preview
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(harness, session_id) DO UPDATE SET
                 parent_harness = COALESCE(excluded.parent_harness, sessions.parent_harness),
                 parent_session_id = COALESCE(excluded.parent_session_id, \
@@ -311,7 +313,7 @@ impl AiSessionDatabase {
                 model = COALESCE(excluded.model, sessions.model),
                 started_at = MIN(sessions.started_at, excluded.started_at),
                 updated_at = MAX(sessions.updated_at, excluded.updated_at),
-                message_count = sessions.message_count + 1,
+                message_count = sessions.message_count + excluded.message_count,
                 title = COALESCE(excluded.title, sessions.title),
                 preview = COALESCE(sessions.preview, excluded.preview)",
         )
@@ -324,6 +326,7 @@ impl AiSessionDatabase {
         .bind(msg.model.as_deref())
         .bind(timestamp)
         .bind(timestamp)
+        .bind(counted)
         .bind(title)
         .bind(preview)
         .execute(&mut *tx)
@@ -1283,6 +1286,33 @@ mod tests {
         assert_eq!(s.message_count, 1);
         let got: Vec<_> = db.messages(&m.session).try_collect().await.unwrap();
         assert_eq!(got[0].turn_id.as_deref(), Some("msg_01"));
+    }
+
+    /// Rows that carry only usage, a title or session context are stored, but are no messages.
+    #[rstest]
+    #[tokio::test]
+    async fn structural_rows_are_not_counted_as_messages() {
+        let db = AiSessionDatabase::in_memory().await.unwrap();
+        let spoken = sample_message();
+        let mut usage_only = sample_message();
+        usage_only.source_id = SourceId::from("usage".to_owned());
+        usage_only.content = Vec::new();
+        usage_only.usage = Some(Usage {
+            input: Some(1),
+            ..Usage::default()
+        });
+        let mut titled = sample_message();
+        titled.source_id = SourceId::from("title".to_owned());
+        titled.content = Vec::new();
+        titled.session_title = Some("a title".to_owned());
+        for m in [&spoken, &usage_only, &titled] {
+            assert_eq!(db.append(m).await.unwrap(), Appended::New);
+        }
+
+        let s = db.get_session(&spoken.session).await.unwrap().unwrap();
+        assert_eq!(s.message_count, 1);
+        assert_eq!(s.usage.input, Some(1));
+        assert_eq!(s.title.as_deref(), Some("a title"));
     }
 
     #[rstest]

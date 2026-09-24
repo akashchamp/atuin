@@ -1002,6 +1002,11 @@ impl Session for OpencodeSession {
             while let Some((_, message)) = drain.next().await {
                 yield message;
             }
+            // A drain also ends on a failed read; a one-shot read says so rather than passing
+            // for the whole session.
+            if reader.failed() {
+                yield Err(MessageError::Incomplete);
+            }
         }
     }
 
@@ -3197,6 +3202,36 @@ mod tests {
             insert_event(db, "evt_04", SES, "message.part.updated.1", &text.to_string()).await;
             part_row(db, "evt_05", step_finish(SES, "prt_a2", "msg_a1", 1200)).await;
             message_updated(db, "evt_06", &assistant_info(1200, None)).await;
+        }
+
+        /// A one-shot read whose store fails partway ends in an error, not in a stream that
+        /// passes for the whole session.
+        #[rstest]
+        #[tokio::test]
+        async fn a_read_that_fails_partway_says_so() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("opencode.db");
+            let db = event_db(&path).await;
+            seed_turn(&db).await;
+            let sessions: Vec<OpencodeSession> = OpencodeSessions::builder()
+                .db(&path)
+                .build()
+                .existing()
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+                .await;
+            let [session] = <[_; 1]>::try_from(sessions).unwrap();
+            query::<sqlx::Sqlite>("DROP TABLE event")
+                .execute(&mut *db.pool().acquire().await.unwrap())
+                .await
+                .unwrap();
+
+            let read: Vec<_> = session.read().collect().await;
+            assert!(
+                matches!(read.last(), Some(Err(MessageError::Incomplete))),
+                "a failed read ended the stream silently: {read:?}"
+            );
         }
 
         async fn seeded() -> (tempfile::TempDir, Vec<OpencodeMessage>) {
