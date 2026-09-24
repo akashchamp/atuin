@@ -561,7 +561,7 @@ impl Message for PiMessage {
             output: count("output"),
             cache_read: count("cacheRead"),
             cache_write: count("cacheWrite"),
-            reasoning: None,
+            reasoning: count("reasoning"),
         })
     }
 

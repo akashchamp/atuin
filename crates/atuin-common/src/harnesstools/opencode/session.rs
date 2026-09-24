@@ -1580,7 +1580,8 @@ impl Message for OpencodeMessage {
         if !counts.is_object() {
             return None;
         }
-        let output = match (tokens(&counts["output"]), tokens(&counts["reasoning"])) {
+        let reasoning = tokens(&counts["reasoning"]);
+        let output = match (tokens(&counts["output"]), reasoning) {
             (None, None) => None,
             (output, reasoning) => {
                 Some(output.unwrap_or_default().saturating_add(reasoning.unwrap_or_default()))
@@ -1591,7 +1592,7 @@ impl Message for OpencodeMessage {
             output,
             cache_read: tokens(&counts["cache"]["read"]),
             cache_write: tokens(&counts["cache"]["write"]),
-            reasoning: None,
+            reasoning,
         })
     }
 
@@ -3222,7 +3223,7 @@ mod tests {
                 output: Some(290),
                 cache_read: Some(900),
                 cache_write: Some(30),
-                reasoning: None,
+                reasoning: Some(40),
             })]);
             let step = find(&messages, "prt_a2");
             assert!(step.content().is_empty());
@@ -3554,11 +3555,11 @@ mod tests {
     #[rstest]
     #[case::whole(
         serde_json::json!({"input": 10, "output": 5, "reasoning": 2, "cache": {"read": 3, "write": 1}}),
-        Some(Usage { input: Some(10), output: Some(7), cache_read: Some(3), cache_write: Some(1), reasoning: None })
+        Some(Usage { input: Some(10), output: Some(7), cache_read: Some(3), cache_write: Some(1), reasoning: Some(2) })
     )]
     #[case::fractional_and_negative(
         serde_json::json!({"input": 10.4, "output": -5, "reasoning": 2, "cache": {"read": 3}}),
-        Some(Usage { input: Some(10), output: Some(2), cache_read: Some(3), cache_write: None, reasoning: None })
+        Some(Usage { input: Some(10), output: Some(2), cache_read: Some(3), cache_write: None, reasoning: Some(2) })
     )]
     #[case::no_output_at_all(
         serde_json::json!({"input": 10}),

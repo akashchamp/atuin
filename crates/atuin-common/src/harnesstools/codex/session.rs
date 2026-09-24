@@ -420,7 +420,7 @@ fn usage_of(usage: &serde_json::Value) -> Option<Usage> {
         output: field("output_tokens"),
         cache_read,
         cache_write: field("cache_write_input_tokens"),
-        reasoning: None,
+        reasoning: field("reasoning_output_tokens"),
     })
 }
 
@@ -1167,7 +1167,7 @@ mod tests {
                 output: Some(100),
                 cache_read: Some(10_000),
                 cache_write: Some(0),
-                reasoning: None,
+                reasoning: Some(0),
             })
         );
         assert!(m.turn_id().is_some(), "usage-bearing line without a turn id");

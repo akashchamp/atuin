@@ -539,7 +539,7 @@ impl Message for CcodeMessage {
             output: field("output_tokens"),
             cache_read: field("cache_read_input_tokens"),
             cache_write,
-            reasoning: None,
+            reasoning: self.thinking_tokens(),
         })
     }
 
